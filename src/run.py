@@ -8,14 +8,15 @@ sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 from model import build_transformer_model
 
 #%%
-model = build_transformer_model(t_fixed = 200)
+model = build_transformer_model(past_window_size = 200,
+                                n_transformer_blocks=4)
 
 #%%
 # Create sample data to test the model
 # Sample parameters
 batch_size = 4
 n = 10  # number of time series
-t = 200  # fixed time dimension (matches t_fixed)
+t = 200  # fixed time dimension (matches past_window_size)
 
 # Create sample matrix input (batch_size, n, t)
 matrix_input = torch.randn(batch_size, n, t)
@@ -48,14 +49,14 @@ try:
     # Test the data loader with corrected dimensions
     matrix_batch, sample_info = create_time_series_batches(
         df=sample_df,
-        t_fixed=100,  # Half of model's t_fixed since data loader does t_fixed*2
+        past_window_size=100,  # Half of model's past_window_size since data loader does past_window_size*2
         n_cols=10,    # This becomes 'n' dimension
         batch_size=4
     )
     
     print(f"\nData loader test:")
     print(f"Matrix batch shape: {matrix_batch.shape}")
-    print(f"Expected model input shape: (batch_size, n, t_fixed) = (4, 10, 200)")
+    print(f"Expected model input shape: (batch_size, n, past_window_size) = (4, 10, 200)")
     
     # Test with model
     scalar_batch = torch.randn(4, 1)

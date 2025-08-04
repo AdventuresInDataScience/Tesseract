@@ -141,25 +141,25 @@ class GPT2LikeTransformer(nn.Module):
     
     def __init__(
         self,
-        t_fixed: int,
+        past_window_size: int,
         d_model: int = 512,
         n_heads: int = 8,
-        n_layers: int = 6,
+        n_transformer_blocks: int = 6,
         d_ff: int = 2048,
-        d_mlp_hidden: int = 1024,
+        d_mlp_hidden: int = 2048,
         dropout: float = 0.1,
         max_n: int = 1000,
         causal: bool = True
     ):
         super().__init__()
         
-        self.t_fixed = t_fixed
+        self.past_window_size = past_window_size
         self.d_model = d_model
-        self.n_layers = n_layers
+        self.n_layers = n_transformer_blocks
         self.causal = causal
         
         # Input projection for the matrix input (n x t -> n x d_model)
-        self.input_projection = nn.Linear(t_fixed, d_model)
+        self.input_projection = nn.Linear(past_window_size, d_model)
         
         # Scalar embedding and projection
         self.scalar_embedding = nn.Linear(1, d_model)
@@ -171,7 +171,7 @@ class GPT2LikeTransformer(nn.Module):
         self.transformer_blocks = nn.ModuleList()
         self.intermediate_mlps = nn.ModuleList()
         
-        for _ in range(n_layers):
+        for _ in range(n_transformer_blocks):
             self.transformer_blocks.append(
                 TransformerBlock(d_model, n_heads, d_ff, dropout, causal)
             )
@@ -203,14 +203,14 @@ class GPT2LikeTransformer(nn.Module):
         Forward pass.
         
         Args:
-            matrix_input: Tensor of shape (batch_size, n, t_fixed)
+            matrix_input: Tensor of shape (batch_size, n, past_window_size)
             scalar_input: Tensor of shape (batch_size, 1)
         
         Returns:
             output: Tensor of shape (batch_size, n) after softmax
         """
         batch_size, n, t = matrix_input.shape
-        assert t == self.t_fixed, f"Expected t={self.t_fixed}, got t={t}"
+        assert t == self.past_window_size, f"Expected t={self.past_window_size}, got t={t}"
         
         # Project matrix input to d_model
         x = self.input_projection(matrix_input)  # (batch_size, n, d_model)
@@ -260,12 +260,12 @@ class GPT2LikeTransformer(nn.Module):
 
 #------------ Model Building Function -----------
 def build_transformer_model(
-    t_fixed: int,
+    past_window_size: int,
     d_model: int = 512,
     n_heads: int = 8,
-    n_layers: int = 6,
+    n_transformer_blocks: int = 6,
     d_ff: int = 2048,
-    d_mlp_hidden: int = 1024,
+    d_mlp_hidden: int = 2048,
     dropout: float = 0.1,
     max_n: int = 1000,
     causal: bool = True
@@ -274,10 +274,10 @@ def build_transformer_model(
     Build a GPT-2-like transformer model with specified architecture.
     
     Args:
-        t_fixed: Fixed dimension t for input matrices (n x t)
+        past_window_size: Fixed dimension t for input matrices (n x t)
         d_model: Model dimension (embedding size)
         n_heads: Number of attention heads
-        n_layers: Number of transformer blocks
+        n_transformer_blocks: Number of transformer blocks
         d_ff: Feed-forward network hidden dimension
         d_mlp_hidden: Intermediate MLP hidden dimension
         dropout: Dropout probability
@@ -288,16 +288,16 @@ def build_transformer_model(
         GPT2LikeTransformer model ready for training
     
     Example:
-        >>> model = build_transformer_model(t_fixed=10, n_layers=4, causal=True)
+        >>> model = build_transformer_model(past_window_size=10, n_transformer_blocks=4, causal=True)
         >>> matrix_input = torch.randn(32, 50, 10)  # batch_size=32, n=50, t=10
         >>> scalar_input = torch.randn(32, 1)       # batch_size=32, scalar=1
         >>> output = model(matrix_input, scalar_input)  # shape: (32, 50)
     """
     model = GPT2LikeTransformer(
-        t_fixed=t_fixed,
+        past_window_size=past_window_size,
         d_model=d_model,
         n_heads=n_heads,
-        n_layers=n_layers,
+        n_transformer_blocks=n_transformer_blocks,
         d_ff=d_ff,
         d_mlp_hidden=d_mlp_hidden,
         dropout=dropout,
@@ -314,7 +314,7 @@ def create_portfolio_time_series():
     return 0
 
 #--------------Objective functions/metrics--------------
-def sharpe_ratio()
+def sharpe_ratio():
     return 0
 
 def max_drawdown():
@@ -350,5 +350,6 @@ def custom_loss_fn(x_pred, df_past, df_future, objective):
     
     return loss
 
-def training_loop()
+def training_loop():
+    return 0
 
