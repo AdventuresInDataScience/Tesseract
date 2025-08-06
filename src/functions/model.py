@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
+import pandas as pd
+import numpy as np
 
 #------------ Model Components -----------
 class MultiHeadAttention(nn.Module):
@@ -310,8 +312,37 @@ def build_transformer_model(
 
 
 #--------------Portfolio Creation Function--------------
-def create_portfolio_time_series():
-    return 0
+def create_portfolio_time_series(stocks_matrix, weights_vector):
+    """
+    Create portfolio time series from stock returns and weights.
+    
+    Args:
+        stocks_matrix: numpy array of shape (timesteps, n_stocks) - from pandas_df.values
+        weights_vector: torch tensor of shape (n_stocks,) - model output weights
+    
+    Returns:
+        portfolio_returns: torch tensor of shape (timesteps,) - portfolio returns over time
+    
+    Example:
+        >>> # From pandas DataFrame
+        >>> stocks_df = pd.DataFrame(np.random.randn(100, 5))  # 100 timesteps, 5 stocks
+        >>> stocks_matrix = stocks_df.values  # Convert to numpy
+        >>> weights_vector = torch.softmax(torch.randn(5), dim=0)  # Model output (sums to 1)
+        >>> portfolio = create_portfolio_time_series(stocks_matrix, weights_vector)
+        >>> portfolio.shape  # torch.Size([100])
+    """
+    # Convert numpy stocks_matrix to torch tensor if needed
+    if not isinstance(stocks_matrix, torch.Tensor):
+        stocks_matrix = torch.from_numpy(stocks_matrix).float()
+    
+    # Ensure weights_vector is torch tensor (should already be from model output)
+    if not isinstance(weights_vector, torch.Tensor):
+        weights_vector = torch.tensor(weights_vector, dtype=torch.float32)
+    
+    # Matrix multiply: (timesteps, n_stocks) @ (n_stocks,) = (timesteps,)
+    portfolio_returns = torch.matmul(stocks_matrix, weights_vector)
+    
+    return portfolio_returns
 
 #--------------Objective functions/metrics--------------
 def sharpe_ratio():
@@ -340,10 +371,10 @@ def treynor_ratio():
 
 
 #------------ Custom Loss Function -----------
-def calclate_expected_metric(x_pred, df, metric):
+def calculate_expected_metric(x_pred, df, metric):
     return expected_metric
 
-def calclate_best_metric(x_pred, df, metric):
+def calculate_best_metric(x_pred, df, metric):
     return best_metric
 
 def custom_loss_fn(x_pred, df_past, df_future, objective):

@@ -5,7 +5,7 @@ import os
 import torch
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 
-from model import build_transformer_model
+from model import *
 
 #%%
 model = build_transformer_model(past_window_size = 200,
@@ -68,4 +68,10 @@ try:
 except Exception as e:
     print(f"❌ Data loader needs adjustment: {e}")
 
+# %%
+# test the create_portfolio_time_series function
+stocks_matrix = np.random.randn(100, 10)  # 100 timesteps, 10 assets
+weights_vector = np.random.randn(10)  # 10 assets
+example = create_portfolio_time_series(stocks_matrix, weights_vector)
+print(f"Example portfolio time series shape: {example.shape}")
 # %%
