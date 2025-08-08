@@ -64,7 +64,7 @@ def create_single_sample(data_array, past_window_size, future_window_size, n_col
         # Randomly sample n_cols from valid columns
         selected_cols = np.random.choice(valid_col_indices, size=n_cols, replace=False)
         col_sample = data_slice[:, selected_cols]
-        return col_sample.T  # Transpose to (n_cols, past_window_size+future_window_size)
+        sample_array = col_sample.T  # Transpose to (n_cols, past_window_size+future_window_size)
     else:
         # Create zero-padded sample to maintain batch size
         sample_array = np.zeros((n_cols, past_window_size + future_window_size))
@@ -73,7 +73,18 @@ def create_single_sample(data_array, past_window_size, future_window_size, n_col
             available_cols = min(len(valid_col_indices), n_cols)
             selected_cols = np.random.choice(valid_col_indices, size=available_cols, replace=False)
             sample_array[:available_cols, :] = data_slice[:, selected_cols].T
-        return sample_array
+    
+    # Apply scaling: divide each row by the value at the end of past_window_size
+    # This ensures the last timestep of past_window becomes 1.0 for each asset
+    scaling_values = sample_array[:, past_window_size - 1]  # Values at end of past window
+    
+    # Avoid division by zero - only scale rows where scaling value is non-zero
+    # This should never happen. May need to change this logic in future
+    non_zero_mask = scaling_values != 0
+    if np.any(non_zero_mask):
+        sample_array[non_zero_mask, :] = sample_array[non_zero_mask, :] / scaling_values[non_zero_mask, np.newaxis]
+    
+    return sample_array
 
 def create_batch(data_array, past_window_size, future_window_size, n_cols, batch_size, valid_indices):
     """
@@ -151,25 +162,8 @@ def __placeholder_func(data, past_window_size, future_window_size, min_n_cols, m
         past_batch, future_batch = create_batch(data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
         
         # Temp output example
+        # Placeholder for updating model weights/fit
         print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch.shape}, {future_batch.shape})")
         
 
 #%%
-
-
-#%%
-#build some sample data and test the functions
-example_data = np.random.randn(1000, 50)  # 1000 timesteps, 50 assets
-
-# Test progressive training: start with 2 cols/batch_size=2, end with 10 cols/batch_size=16
-__placeholder_func(
-    example_data, 
-    past_window_size=100, 
-    future_window_size=50,  # Added missing parameter
-    min_n_cols=2, 
-    max_n_cols=10, 
-    min_batch_size=2, 
-    max_batch_size=16, 
-    iterations=10
-)
-# %%

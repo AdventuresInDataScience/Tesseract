@@ -3,9 +3,12 @@
 import sys
 import os
 import torch
+import numpy as np
+import pandas as pd
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 
 from model import *
+from data import *
 
 #%%
 model = build_transformer_model(past_window_size = 200,
@@ -37,41 +40,63 @@ print(f"Output (first batch, first 5 values): {output[0, :5]}")
 print(f"Output sum per batch (should be ~1.0 due to softmax): {output.sum(dim=1)}")
 print(f"Model has {model.get_num_parameters():,} parameters")
 
+# %%
+#build some sample data and test the functions
+example_data = np.random.randn(1000, 50)  # 1000 timesteps, 50 assets
+
+# Test progressive training: start with 2 cols/batch_size=2, end with 10 cols/batch_size=16
+__placeholder_func(
+    example_data, 
+    past_window_size=100, 
+    future_window_size=50,  # Added missing parameter
+    min_n_cols=2, 
+    max_n_cols=10, 
+    min_batch_size=2, 
+    max_batch_size=16, 
+    iterations=10
+)
+# %%
+# test create_portfolio_time_series function
+# Example 1: NumPy stocks matrix (from pandas.values) + PyTorch weights (from model output)
+stocks_matrix = np.random.randn(252, 10)  # 252 trading days, 10 stocks
+weights_vector = torch.softmax(torch.randn(10), dim=0)  # Model output (normalized to sum=1)
+
+print(f"Test 1 - Real scenario:")
+print(f"  stocks_matrix type: {type(stocks_matrix)}, shape: {stocks_matrix.shape}")
+print(f"  weights_vector type: {type(weights_vector)}, shape: {weights_vector.shape}")
+print(f"  weights sum: {weights_vector.sum():.4f} (should be ~1.0)")
+
+portfolio_returns = create_portfolio_time_series(stocks_matrix, weights_vector)
+print(f"  portfolio_returns type: {type(portfolio_returns)}, shape: {portfolio_returns.shape}")
+print(f"  portfolio mean return: {portfolio_returns.mean():.4f}")
+print(f"  portfolio std: {portfolio_returns.std():.4f}")
+print("  ✅ Success!\n")
+
+# Example 2: Test with equal weights (should work like simple average)
+equal_weights = torch.ones(10) / 10  # Equal weights: [0.1, 0.1, ..., 0.1]
+portfolio_equal = create_portfolio_time_series(stocks_matrix, equal_weights)
+manual_average = torch.from_numpy(stocks_matrix).float().mean(dim=1)  # Manual average
+
+print(f"Test 2 - Equal weights validation:")
+print(f"  Equal weights portfolio mean: {portfolio_equal.mean():.4f}")
+print(f"  Manual average mean: {manual_average.mean():.4f}")
+print(f"  Difference: {torch.abs(portfolio_equal - manual_average).max():.6f} (should be ~0)")
+print("  ✅ Equal weights test passed!\n")
+
+# Example 3: Test with extreme weights (all weight on first stock)
+extreme_weights = torch.zeros(10)
+extreme_weights[0] = 1.0  # 100% weight on first stock
+portfolio_extreme = create_portfolio_time_series(stocks_matrix, extreme_weights)
+first_stock_returns = torch.from_numpy(stocks_matrix[:, 0]).float()
+
+print(f"Test 3 - Extreme weights validation:")
+print(f"  100% first stock portfolio mean: {portfolio_extreme.mean():.4f}")
+print(f"  First stock returns mean: {first_stock_returns.mean():.4f}")
+print(f"  Difference: {torch.abs(portfolio_extreme - first_stock_returns).max():.6f} (should be ~0)")
+print("  ✅ Extreme weights test passed!\n")
+
+print("All tests completed successfully! 🎉")
+
+# %%
 #%%
-# Test with data loader (requires fixing the data module)
-from data import create_time_series_batches
-import pandas as pd
-
-# Create sample DataFrame to test data loading
-sample_df = pd.DataFrame(torch.randn(1000, 50).numpy())  # 1000 timesteps, 50 assets
-
-try:
-    # Test the data loader with corrected dimensions
-    matrix_batch, sample_info = create_time_series_batches(
-        df=sample_df,
-        past_window_size=100,  # Half of model's past_window_size since data loader does past_window_size*2
-        n_cols=10,    # This becomes 'n' dimension
-        batch_size=4
-    )
-    
-    print(f"\nData loader test:")
-    print(f"Matrix batch shape: {matrix_batch.shape}")
-    print(f"Expected model input shape: (batch_size, n, past_window_size) = (4, 10, 200)")
-    
-    # Test with model
-    scalar_batch = torch.randn(4, 1)
-    with torch.no_grad():
-        output = model(matrix_batch, scalar_batch)
-        print(f"Model output shape: {output.shape}")
-        print("✅ Data loader compatible with model!")
-        
-except Exception as e:
-    print(f"❌ Data loader needs adjustment: {e}")
-
-# %%
-# test the create_portfolio_time_series function
-stocks_matrix = np.random.randn(100, 10)  # 100 timesteps, 10 assets
-weights_vector = np.random.randn(10)  # 10 assets
-example = create_portfolio_time_series(stocks_matrix, weights_vector)
-print(f"Example portfolio time series shape: {example.shape}")
-# %%
+#
