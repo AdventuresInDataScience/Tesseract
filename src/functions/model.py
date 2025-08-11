@@ -187,6 +187,12 @@ class GPT2LikeTransformer(nn.Module):
         # Output projection (only for the matrix part, not scalar)
         self.output_projection = nn.Linear(d_model, 1)
         
+        # Constraint parameters (will be set via forward pass)
+        self.max_weight = None
+        self.min_assets = None
+        self.max_assets = None
+        self.sparsity_threshold = None
+        
         # Initialize weights
         self.apply(self._init_weights)
     
@@ -200,16 +206,87 @@ class GPT2LikeTransformer(nn.Module):
             torch.nn.init.ones_(module.weight)
             torch.nn.init.zeros_(module.bias)
     
-    def forward(self, matrix_input: torch.Tensor, scalar_input: torch.Tensor) -> torch.Tensor:
+    def constrained_softmax(self, logits: torch.Tensor, max_weight: Optional[float] = None, 
+                           min_assets: Optional[int] = None, max_assets: Optional[int] = None,
+                           sparsity_threshold: float = 0.01) -> torch.Tensor:
         """
-        Forward pass.
+        Apply constrained softmax with portfolio constraints.
+        
+        Args:
+            logits: Raw logits from the model
+            max_weight: Maximum weight for any single asset (e.g., 0.5 for 50%)
+            min_assets: Minimum number of assets to hold
+            max_assets: Maximum number of assets to hold
+            sparsity_threshold: Threshold below which weights are set to 0
+        
+        Returns:
+            Constrained weight vector that sums to 1
+        """
+        batch_size, n_assets = logits.shape
+        
+        # Start with standard softmax
+        weights = F.softmax(logits, dim=-1)
+        
+        # Apply sparsity threshold - set small weights to 0
+        if sparsity_threshold > 0:
+            mask = weights >= sparsity_threshold
+            weights = weights * mask.float()
+            # Renormalize
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Apply maximum weight constraint
+        if max_weight is not None:
+            weights = torch.clamp(weights, max=max_weight)
+            # Renormalize
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Apply asset count constraints
+        if min_assets is not None or max_assets is not None:
+            for i in range(batch_size):
+                w = weights[i]
+                non_zero_count = (w > 1e-8).sum().item()
+                
+                # If too few assets, select top additional ones
+                if min_assets is not None and non_zero_count < min_assets:
+                    needed = min_assets - non_zero_count
+                    # Find indices of zero weights
+                    zero_indices = (w <= 1e-8).nonzero().squeeze(-1)
+                    if len(zero_indices) >= needed:
+                        # Select top 'needed' assets from zero weights based on original logits
+                        original_scores = logits[i][zero_indices]
+                        _, top_indices = torch.topk(original_scores, needed)
+                        selected_indices = zero_indices[top_indices]
+                        # Give small positive weights
+                        w[selected_indices] = 0.01
+                
+                # If too many assets, keep only top ones
+                elif max_assets is not None and non_zero_count > max_assets:
+                    _, top_indices = torch.topk(w, max_assets)
+                    new_w = torch.zeros_like(w)
+                    new_w[top_indices] = w[top_indices]
+                    w = new_w
+                
+                # Renormalize this sample
+                weights[i] = w / (w.sum() + 1e-8)
+        
+        return weights
+
+    def forward(self, matrix_input: torch.Tensor, scalar_input: torch.Tensor, 
+                max_weight: Optional[float] = None, min_assets: Optional[int] = None, 
+                max_assets: Optional[int] = None, sparsity_threshold: float = 0.01) -> torch.Tensor:
+        """
+        Forward pass with portfolio constraints.
         
         Args:
             matrix_input: Tensor of shape (batch_size, n, past_window_size)
             scalar_input: Tensor of shape (batch_size, 1)
+            max_weight: Maximum weight for any single asset (e.g., 0.5 for 50%)
+            min_assets: Minimum number of assets to hold
+            max_assets: Maximum number of assets to hold
+            sparsity_threshold: Threshold below which weights are set to 0
         
         Returns:
-            output: Tensor of shape (batch_size, n) after softmax
+            output: Tensor of shape (batch_size, n) - constrained portfolio weights
         """
         batch_size, n, t = matrix_input.shape
         assert t == self.past_window_size, f"Expected t={self.past_window_size}, got t={t}"
@@ -248,11 +325,11 @@ class GPT2LikeTransformer(nn.Module):
         # Extract only the matrix part (exclude scalar position)
         matrix_output = x[:, :-1, :]  # (batch_size, n, d_model)
         
-        # Project to single values and squeeze
-        output = self.output_projection(matrix_output).squeeze(-1)  # (batch_size, n)
+        # Project to single values (logits, not probabilities yet)
+        logits = self.output_projection(matrix_output).squeeze(-1)  # (batch_size, n)
         
-        # Apply softmax
-        output = F.softmax(output, dim=-1)
+        # Apply constrained softmax
+        output = self.constrained_softmax(logits, max_weight, min_assets, max_assets, sparsity_threshold)
         
         return output
     
@@ -293,7 +370,10 @@ def build_transformer_model(
         >>> model = build_transformer_model(past_window_size=10, n_transformer_blocks=4, causal=True)
         >>> matrix_input = torch.randn(32, 50, 10)  # batch_size=32, n=50, t=10
         >>> scalar_input = torch.randn(32, 1)       # batch_size=32, scalar=1
+        >>> # Basic usage
         >>> output = model(matrix_input, scalar_input)  # shape: (32, 50)
+        >>> # With constraints
+        >>> output = model(matrix_input, scalar_input, max_weight=0.5, min_assets=5, max_assets=20, sparsity_threshold=0.02)
     """
     model = GPT2LikeTransformer(
         past_window_size=past_window_size,
@@ -698,6 +778,37 @@ def k_ratio(portfolio_price_timeseries):
     # K-ratio = slope * sqrt(R-squared) * sqrt(n) (negative for PyTorch minimization - higher K-ratio is better)
     return -(slope * torch.sqrt(r_squared) * torch.sqrt(torch.tensor(n, dtype=torch.float32)))
 #------------ Custom Loss Function -----------
+def portfolio_regularization_loss(weights: torch.Tensor, max_weight: float = 0.5, 
+                                 sparsity_lambda: float = 0.01, concentration_lambda: float = 0.01) -> torch.Tensor:
+    """
+    Calculate regularization losses for portfolio constraints.
+    
+    Args:
+        weights: Portfolio weights tensor of shape (batch_size, n_assets)
+        max_weight: Maximum allowed weight for any asset
+        sparsity_lambda: Weight for sparsity regularization (encourages fewer assets)
+        concentration_lambda: Weight for concentration penalty (discourages max weight violations)
+    
+    Returns:
+        Total regularization loss
+    """
+    batch_size, n_assets = weights.shape
+    
+    # Sparsity regularization - L1 penalty to encourage sparse portfolios
+    sparsity_loss = sparsity_lambda * torch.sum(torch.abs(weights), dim=1).mean()
+    
+    # Concentration penalty - penalize weights above max_weight
+    excess_weights = torch.clamp(weights - max_weight, min=0.0)
+    concentration_loss = concentration_lambda * torch.sum(excess_weights ** 2, dim=1).mean()
+    
+    # Asset count penalty (alternative approach)
+    # Count non-zero weights and penalize if too many
+    non_zero_counts = (weights > 0.01).float().sum(dim=1)  # Count weights > 1%
+    count_penalty = 0.001 * torch.clamp(non_zero_counts - 20, min=0.0).mean()  # Penalize > 20 assets
+    
+    return sparsity_loss + concentration_loss + count_penalty
+
+
 def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
     """
     Calculate expected metric using a dictionary mapping approach.
@@ -732,13 +843,6 @@ def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
     
     # Call the appropriate metric function
     return metric_functions[metric](x_pred, *args, **kwargs)
-
-def calculate_best_metric(x_pred, df, metric):
-    return best_metric
-
-def custom_loss_fn(x_pred, df_past, df_future, objective):
-    
-    return loss
 
 def training_loop():
     return 0
