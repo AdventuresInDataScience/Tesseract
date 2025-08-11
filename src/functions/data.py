@@ -117,7 +117,9 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
     
     return past_batch, future_batch
 
-def __placeholder_func(data, past_window_size, future_window_size, min_n_cols, max_n_cols, min_batch_size, max_batch_size, iterations):
+def placeholder_func(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
+                       max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
+                       metric ='sharpe_ratio', max_weight=1, min_assets=0, max_assets=None, sparsity_threshold=0.01,):
     """
     Progressive batch creation with curriculum learning.
     Starts with small batch_size and n_cols, gradually increases both.
@@ -138,6 +140,9 @@ def __placeholder_func(data, past_window_size, future_window_size, min_n_cols, m
         current_n_cols: Current number of columns being used
         current_batch_size: Current batch size being used
     """
+    # Set model to train mode
+    model.train()
+
     # Convert DataFrame to numpy array if needed
     if hasattr(data, 'values'):  # Check if it's a DataFrame
         data_array = data.values
@@ -163,7 +168,8 @@ def __placeholder_func(data, past_window_size, future_window_size, min_n_cols, m
         
         # Temp output example
         # Placeholder for updating model weights/fit
-        print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch.shape}, {future_batch.shape})")
-        
+        # print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch.shape}, {future_batch.shape})")
+        update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
+                     max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold)
 
 #%%

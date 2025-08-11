@@ -240,10 +240,12 @@ class GPT2LikeTransformer(nn.Module):
             # Renormalize
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Apply asset count constraints
+        # Apply asset count constraints (needs to be non-inplace)
         if min_assets is not None or max_assets is not None:
+            # Process each sample in the batch
+            new_weights = []
             for i in range(batch_size):
-                w = weights[i]
+                w = weights[i].clone()  # Clone to avoid in-place operations
                 non_zero_count = (w > 1e-8).sum().item()
                 
                 # If too few assets, select top additional ones
@@ -256,18 +258,22 @@ class GPT2LikeTransformer(nn.Module):
                         original_scores = logits[i][zero_indices]
                         _, top_indices = torch.topk(original_scores, needed)
                         selected_indices = zero_indices[top_indices]
-                        # Give small positive weights
-                        w[selected_indices] = 0.01
+                        # Give small positive weights (create new tensor instead of in-place)
+                        w = w.scatter(0, selected_indices, torch.tensor(0.01, device=w.device))
                 
                 # If too many assets, keep only top ones
                 elif max_assets is not None and non_zero_count > max_assets:
                     _, top_indices = torch.topk(w, max_assets)
                     new_w = torch.zeros_like(w)
-                    new_w[top_indices] = w[top_indices]
+                    new_w = new_w.scatter(0, top_indices, w[top_indices])
                     w = new_w
                 
                 # Renormalize this sample
-                weights[i] = w / (w.sum() + 1e-8)
+                w = w / (w.sum() + 1e-8)
+                new_weights.append(w)
+            
+            # Stack back into batch tensor
+            weights = torch.stack(new_weights, dim=0)
         
         return weights
 
@@ -389,6 +395,35 @@ def build_transformer_model(
     
     print(f"Model created with {model.get_num_parameters():,} parameters")
     return model
+
+
+def create_adam_optimizer(model, lr=1e-4, weight_decay=1e-5, betas=(0.9, 0.999), eps=1e-8):
+    """
+    Create Adam optimizer with good defaults for transformer training.
+    
+    Args:
+        model: The model to optimize
+        lr: Learning rate (default 1e-4 - good for transformers)
+        weight_decay: L2 regularization weight (default 1e-5)
+        betas: Adam beta parameters (default (0.9, 0.999))
+        eps: Adam epsilon for numerical stability (default 1e-8)
+    
+    Returns:
+        torch.optim.Adam optimizer ready for training
+    
+    Example:
+        >>> model = build_transformer_model(past_window_size=10)
+        >>> optimizer = create_adam_optimizer(model, lr=2e-4)
+        >>> # Use in training loop
+        >>> result = update_model(model, optimizer, past_batch, future_batch, 'sharpe_ratio')
+    """
+    return torch.optim.Adam(
+        model.parameters(), 
+        lr=lr, 
+        weight_decay=weight_decay,
+        betas=betas,
+        eps=eps
+    )
 
 
 #--------------Time series from Portfolio and weights Functions--------------
@@ -847,3 +882,95 @@ def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
 def training_loop():
     return 0
 
+def update_model(model, optimizer, past_batch, future_batch, metric, 
+                max_weight=None, min_assets=None, max_assets=None, sparsity_threshold=0.01,
+                regularization_lambda=0.0, *args, **kwargs):
+    """
+    Perform forward and backward pass to update the model.
+    
+    Args:
+        model: The GPT2LikeTransformer model to update
+        optimizer: PyTorch optimizer (e.g., Adam, SGD)
+        past_batch: Dictionary containing past data for model input:
+            - 'matrix_input': Tensor of shape (batch_size, n, past_window_size)
+            - 'scalar_input': Tensor of shape (batch_size, 1)
+        future_batch: Dictionary containing future data for loss calculation:
+            - 'returns': Future returns matrix for portfolio evaluation
+        metric: String name of the metric to optimize (e.g., 'sharpe_ratio')
+        max_weight: Maximum weight constraint for portfolio
+        min_assets: Minimum number of assets constraint
+        max_assets: Maximum number of assets constraint
+        sparsity_threshold: Threshold for setting small weights to zero
+        regularization_lambda: Weight for portfolio regularization loss
+        *args, **kwargs: Additional arguments passed to metric calculation
+    
+    Returns:
+        Dictionary containing:
+            - 'loss': The total loss value
+            - 'metric_loss': The primary metric loss
+            - 'reg_loss': The regularization loss (if applied)
+            - 'weights': The predicted portfolio weights
+    """
+    # Zero gradients
+    optimizer.zero_grad()
+    
+    # Extract inputs from past_batch
+    matrix_input = past_batch['matrix_input']
+    scalar_input = past_batch['scalar_input']
+    
+    # Forward pass through model with constraints
+    weights = model(
+        matrix_input, 
+        scalar_input, 
+        max_weight=max_weight,
+        min_assets=min_assets, 
+        max_assets=max_assets,
+        sparsity_threshold=sparsity_threshold
+    )
+    
+    # Extract future returns for portfolio evaluation
+    future_returns = future_batch['returns']  # Shape: (timesteps, n_assets)
+    
+    # Calculate portfolio time series for each sample in the batch
+    batch_size = weights.shape[0]
+    metric_losses = []
+    
+    for i in range(batch_size):
+        # Create portfolio time series from weights and future returns
+        portfolio_timeseries = create_portfolio_time_series(future_returns, weights[i])
+        
+        # Calculate the metric (e.g., Sharpe ratio, etc.)
+        metric_loss = calculate_expected_metric(portfolio_timeseries, None, metric, *args, **kwargs)
+        metric_losses.append(metric_loss)
+    
+    # Average metric loss across batch
+    metric_loss = torch.stack(metric_losses).mean()
+    
+    # Calculate regularization loss if requested
+    reg_loss = torch.tensor(0.0, device=weights.device)
+    if regularization_lambda > 0.0:
+        reg_loss = portfolio_regularization_loss(
+            weights, 
+            max_weight=max_weight or 0.5,
+            sparsity_lambda=regularization_lambda * 0.1,
+            concentration_lambda=regularization_lambda * 0.1
+        )
+    
+    # Total loss
+    total_loss = metric_loss + regularization_lambda * reg_loss
+    
+    # Backward pass
+    total_loss.backward()
+    
+    # Update parameters
+    optimizer.step()
+    
+    # Return loss information and weights
+    return {
+        'loss': total_loss.item(),
+        'metric_loss': metric_loss.item(),
+        'reg_loss': reg_loss.item() if regularization_lambda > 0.0 else 0.0,
+        'weights': weights.detach()
+    }
+
+    
