@@ -23,6 +23,7 @@ which would unbalance the samples.
 import torch
 import numpy as np
 import random
+from model import update_model
 
 def create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices, max_retries=10):
     """
@@ -44,9 +45,21 @@ def create_single_sample(data_array, past_window_size, future_window_size, n_col
     # Slice the array
     data_slice = data_array[start_idx:start_idx + (past_window_size + future_window_size), :]
     
-    # Find columns with no NaN values in this slice
-    valid_cols = ~np.isnan(data_slice).any(axis=0)
-    valid_col_indices = np.where(valid_cols)[0]
+    # Ensure data_slice is numeric (convert to float if needed)
+    if data_slice.dtype == 'object' or not np.issubdtype(data_slice.dtype, np.number):
+        try:
+            data_slice = data_slice.astype(np.float64)
+        except (ValueError, TypeError):
+            # If conversion fails, treat all values as invalid
+            valid_col_indices = np.array([])
+        else:
+            # Find columns with no NaN values in this slice
+            valid_cols = ~np.isnan(data_slice).any(axis=0)
+            valid_col_indices = np.where(valid_cols)[0]
+    else:
+        # Find columns with no NaN values in this slice
+        valid_cols = ~np.isnan(data_slice).any(axis=0)
+        valid_col_indices = np.where(valid_cols)[0]
     
     # Ensure we always get a sample, even if we need to retry or pad
     retry_count = 0
@@ -117,12 +130,16 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
     
     return past_batch, future_batch
 
-def placeholder_func(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
+def train_model(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
-                       metric ='sharpe_ratio', max_weight=1, min_assets=0, max_assets=None, sparsity_threshold=0.01,):
+                       metric ='sharpe_ratio', 
+                       # Constraint ranges for random sampling
+                       max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
+                       max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05)):
     """
-    Progressive batch creation with curriculum learning.
+    Progressive batch creation with curriculum learning and random constraint sampling.
     Starts with small batch_size and n_cols, gradually increases both.
+    Randomly samples different constraints for each iteration to ensure full coverage.
     
     Args:
         data: pandas DataFrame or numpy array of shape (n_timesteps, n_assets)
@@ -133,12 +150,14 @@ def placeholder_func(model, optimizer, data, past_window_size, future_window_siz
         min_batch_size: Starting batch size
         max_batch_size: Final batch size
         iterations: Total number of iterations
+        metric: Metric to optimize
+        max_weight_range: (min, max) range for max_weight constraint sampling
+        min_assets_range: (min, max) range for min_assets constraint sampling  
+        max_assets_range: (min, max) range for max_assets constraint sampling
+        sparsity_threshold_range: (min, max) range for sparsity_threshold sampling
         
-    Yields:
-        past_batch: torch.Tensor of shape (current_batch_size, current_n_cols, past_window_size)
-        future_batch: torch.Tensor of shape (current_batch_size, current_n_cols, future_window_size)
-        current_n_cols: Current number of columns being used
-        current_batch_size: Current batch size being used
+    Returns:
+        Trained model
     """
     # Set model to train mode
     model.train()
@@ -163,13 +182,59 @@ def placeholder_func(model, optimizer, data, past_window_size, future_window_siz
         # Progressive batch_size: start small, end large
         current_batch_size = int(min_batch_size + progress * (max_batch_size - min_batch_size))
         
+        # Randomly sample constraints for this iteration to ensure full coverage
+        max_weight = np.random.uniform(max_weight_range[0], max_weight_range[1])
+        min_assets = np.random.randint(min_assets_range[0], min_assets_range[1] + 1)
+        max_assets = np.random.randint(max_assets_range[0], max_assets_range[1] + 1)
+        sparsity_threshold = np.random.uniform(sparsity_threshold_range[0], sparsity_threshold_range[1])
+        
         # Use the create_batch function to get each batch
-        past_batch, future_batch = create_batch(data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
+        past_batch_tensor, future_batch_tensor = create_batch(data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
+        
+        # Prepare data in the format expected by update_model
+        # past_batch_tensor shape: (batch_size, n_cols, past_window_size)
+        # future_batch_tensor shape: (batch_size, n_cols, future_window_size)
+        
+        # Create input vectors for the model:
+        # 1. Scalar input: future_window_size (prediction parameter)
+        # 2. Constraint vector: [max_weight, min_assets, max_assets, sparsity_threshold] (portfolio constraints)
+        
+        # Scalar input for prediction horizon
+        scalar_input = torch.tensor(future_window_size, dtype=torch.float32).unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 1)
+        
+        # Constraint vector for portfolio constraints
+        # Ensure max_assets doesn't exceed current number of columns
+        effective_max_assets = min(max_assets, current_n_cols)
+        
+        constraint_vector = torch.tensor([
+            max_weight,  # Max weight (0.0-1.0, where 1.0 = unconstrained)
+            min_assets / 100.0,  # Normalize min assets (0-100, where 0 = unconstrained)
+            effective_max_assets / 100.0,  # Normalize max assets (0-100)
+            sparsity_threshold * 100.0  # Scale sparsity threshold (0.01 -> 1.0)
+        ], dtype=torch.float32)
+        
+        # Expand constraint vector to batch size
+        constraint_input = constraint_vector.unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 4)
+        
+        # Format data as dictionaries expected by update_model
+        past_batch = {
+            'matrix_input': past_batch_tensor,  # (batch_size, n_cols, past_window_size)
+            'scalar_input': scalar_input,  # (batch_size, 1) - future_window_size
+            'constraint_input': constraint_input  # (batch_size, 4) - [max_weight, min_assets, max_assets, sparsity]
+        }
+        
+        # For future batch, we need to convert the tensor to returns format
+        # The future_batch_tensor contains normalized price continuations
+        # We need to convert this to a format suitable for portfolio evaluation
+        future_batch = {
+            'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
+        }
         
         # Temp output example
-        # Placeholder for updating model weights/fit
-        # print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch.shape}, {future_batch.shape})")
+        # print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch_tensor.shape}, {future_batch_tensor.shape})")
         update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
                      max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold)
+
+    return model
 
 #%%

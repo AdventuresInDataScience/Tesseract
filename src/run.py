@@ -44,17 +44,27 @@ print(f"Model has {model.get_num_parameters():,} parameters")
 #build some sample data and test the functions
 example_data = np.random.randn(1000, 50)  # 1000 timesteps, 50 assets
 
-# Test progressive training: start with 2 cols/batch_size=2, end with 10 cols/batch_size=16
-__placeholder_func(
-    example_data, 
+# Test training with random constraints
+print("Starting training with random constraint sampling...")
+
+# Create optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Test training function
+train_model(
+    model=model,
+    optimizer=optimizer,
+    data=example_data, 
     past_window_size=100, 
-    future_window_size=50,  # Added missing parameter
-    min_n_cols=2, 
-    max_n_cols=10, 
-    min_batch_size=2, 
-    max_batch_size=16, 
-    iterations=10
+    future_window_size=50,
+    min_n_cols=5, 
+    max_n_cols=15, 
+    min_batch_size=4, 
+    max_batch_size=8, 
+    iterations=5  # Reduced for testing
 )
+
+print("Training completed successfully!")
 # %%
 # test create_portfolio_time_series function
 # Example 1: NumPy stocks matrix (from pandas.values) + PyTorch weights (from model output)

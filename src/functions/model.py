@@ -163,11 +163,14 @@ class GPT2LikeTransformer(nn.Module):
         # Input projection for the matrix input (n x t -> n x d_model)
         self.input_projection = nn.Linear(past_window_size, d_model)
         
-        # Scalar embedding and projection
-        self.scalar_embedding = nn.Linear(1, d_model)
+        # Scalar embedding and projection - handle future window size
+        self.scalar_embedding = nn.Linear(1, d_model)  # Future window size input
+        
+        # Constraint embedding and projection - handle portfolio constraints  
+        self.constraint_embedding = nn.Linear(4, d_model)  # Portfolio constraint vector
         
         # Positional encoding
-        self.pos_encoding = PositionalEncoding(d_model, max_n + 1)  # +1 for scalar
+        self.pos_encoding = PositionalEncoding(d_model, max_n + 2)  # +2 for scalar and constraint tokens
         
         # Transformer blocks and intermediate MLPs
         self.transformer_blocks = nn.ModuleList()
@@ -253,13 +256,21 @@ class GPT2LikeTransformer(nn.Module):
                     needed = min_assets - non_zero_count
                     # Find indices of zero weights
                     zero_indices = (w <= 1e-8).nonzero().squeeze(-1)
+                    
+                    # Make sure we don't try to select more assets than available
                     if len(zero_indices) >= needed:
                         # Select top 'needed' assets from zero weights based on original logits
                         original_scores = logits[i][zero_indices]
                         _, top_indices = torch.topk(original_scores, needed)
                         selected_indices = zero_indices[top_indices]
                         # Give small positive weights (create new tensor instead of in-place)
-                        w = w.scatter(0, selected_indices, torch.tensor(0.01, device=w.device))
+                        values = torch.full((len(selected_indices),), 0.01, device=w.device)
+                        w = w.scatter(0, selected_indices, values)
+                    else:
+                        # If we don't have enough zero weights, just use all available zero weights
+                        if len(zero_indices) > 0:
+                            values = torch.full((len(zero_indices),), 0.01, device=w.device)
+                            w = w.scatter(0, zero_indices, values)
                 
                 # If too many assets, keep only top ones
                 elif max_assets is not None and non_zero_count > max_assets:
@@ -277,19 +288,14 @@ class GPT2LikeTransformer(nn.Module):
         
         return weights
 
-    def forward(self, matrix_input: torch.Tensor, scalar_input: torch.Tensor, 
-                max_weight: Optional[float] = None, min_assets: Optional[int] = None, 
-                max_assets: Optional[int] = None, sparsity_threshold: float = 0.01) -> torch.Tensor:
+    def forward(self, matrix_input: torch.Tensor, scalar_input: torch.Tensor, constraint_input: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with portfolio constraints.
+        Forward pass with prediction horizon and constraints.
         
         Args:
             matrix_input: Tensor of shape (batch_size, n, past_window_size)
-            scalar_input: Tensor of shape (batch_size, 1)
-            max_weight: Maximum weight for any single asset (e.g., 0.5 for 50%)
-            min_assets: Minimum number of assets to hold
-            max_assets: Maximum number of assets to hold
-            sparsity_threshold: Threshold below which weights are set to 0
+            scalar_input: Tensor of shape (batch_size, 1) containing future_window_size
+            constraint_input: Tensor of shape (batch_size, 4) containing [max_weight, min_assets, max_assets, sparsity]
         
         Returns:
             output: Tensor of shape (batch_size, n) - constrained portfolio weights
@@ -297,20 +303,27 @@ class GPT2LikeTransformer(nn.Module):
         batch_size, n, t = matrix_input.shape
         assert t == self.past_window_size, f"Expected t={self.past_window_size}, got t={t}"
         
+        # Extract constraints from constraint input
+        max_weight = constraint_input[:, 0]  # Max weight constraint (1.0 = unconstrained)
+        min_assets = (constraint_input[:, 1] * 100.0).long()  # Denormalize and convert to int
+        max_assets = (constraint_input[:, 2] * 100.0).long()  # Denormalize and convert to int  
+        sparsity_threshold = constraint_input[:, 3] / 100.0  # Denormalize sparsity threshold
+        
         # Project matrix input to d_model
         x = self.input_projection(matrix_input)  # (batch_size, n, d_model)
         
-        # Embed scalar and expand to match sequence length
-        scalar_emb = self.scalar_embedding(scalar_input.unsqueeze(-1))  # (batch_size, 1, d_model)
+        # Embed scalar (future window) and constraint inputs
+        scalar_emb = self.scalar_embedding(scalar_input).unsqueeze(1)  # (batch_size, 1, d_model)
+        constraint_emb = self.constraint_embedding(constraint_input).unsqueeze(1)  # (batch_size, 1, d_model)
         
-        # Concatenate scalar embedding with matrix embeddings
-        x = torch.cat([x, scalar_emb], dim=1)  # (batch_size, n+1, d_model)
+        # Concatenate all embeddings: matrix + scalar + constraint
+        x = torch.cat([x, scalar_emb, constraint_emb], dim=1)  # (batch_size, n+2, d_model)
         
         # Add positional encoding
         x = self.pos_encoding(x)
         
-        # Store scalar embedding for skip connections
-        scalar_skip = scalar_emb.squeeze(1)  # (batch_size, d_model)
+        # Store scalar and constraint embeddings for skip connections
+        combined_context = scalar_emb.squeeze(1) + constraint_emb.squeeze(1)  # (batch_size, d_model)
         
         # Pass through transformer blocks with intermediate MLPs
         for i, (transformer_block, intermediate_mlp) in enumerate(
@@ -319,8 +332,8 @@ class GPT2LikeTransformer(nn.Module):
             # Transformer block
             x = transformer_block(x)
             
-            # Add scalar skip connection to all positions except the last (scalar) position
-            x[:, :-1, :] = x[:, :-1, :] + scalar_skip.unsqueeze(1)
+            # Add combined context skip connection to matrix positions only
+            x[:, :-2, :] = x[:, :-2, :] + combined_context.unsqueeze(1)
             
             # Intermediate MLP
             x = intermediate_mlp(x)
@@ -328,14 +341,26 @@ class GPT2LikeTransformer(nn.Module):
         # Final normalization
         x = self.final_norm(x)
         
-        # Extract only the matrix part (exclude scalar position)
-        matrix_output = x[:, :-1, :]  # (batch_size, n, d_model)
+        # Extract only the matrix part (exclude scalar and constraint positions)
+        matrix_output = x[:, :-2, :]  # (batch_size, n, d_model)
         
         # Project to single values (logits, not probabilities yet)
         logits = self.output_projection(matrix_output).squeeze(-1)  # (batch_size, n)
         
-        # Apply constrained softmax
-        output = self.constrained_softmax(logits, max_weight, min_assets, max_assets, sparsity_threshold)
+        # Apply constrained softmax using extracted constraints
+        # Use the first sample's constraints (assuming homogeneous batches)
+        # Convert to standard constraint format: use large numbers for "unconstrained"
+        effective_max_weight = max_weight[0].item() if max_weight[0].item() < 1.0 else None
+        effective_min_assets = min_assets[0].item() if min_assets[0].item() > 0 else None
+        effective_max_assets = max_assets[0].item() if max_assets[0].item() < n else None
+        
+        output = self.constrained_softmax(
+            logits, 
+            max_weight=effective_max_weight,
+            min_assets=effective_min_assets,
+            max_assets=effective_max_assets,
+            sparsity_threshold=sparsity_threshold[0].item()
+        )
         
         return output
     
@@ -375,11 +400,11 @@ def build_transformer_model(
     Example:
         >>> model = build_transformer_model(past_window_size=10, n_transformer_blocks=4, causal=True)
         >>> matrix_input = torch.randn(32, 50, 10)  # batch_size=32, n=50, t=10
-        >>> scalar_input = torch.randn(32, 1)       # batch_size=32, scalar=1
-        >>> # Basic usage
-        >>> output = model(matrix_input, scalar_input)  # shape: (32, 50)
-        >>> # With constraints
-        >>> output = model(matrix_input, scalar_input, max_weight=0.5, min_assets=5, max_assets=20, sparsity_threshold=0.02)
+        >>> # Scalar input: prediction horizon
+        >>> scalar_input = torch.tensor([20]).repeat(32, 1)  # 20 days ahead
+        >>> # Constraint vector: [max_weight, min_assets, max_assets, sparsity]
+        >>> constraints = torch.tensor([0.5, 5/100, 20/100, 0.02*100]).repeat(32, 1)  # batch_size=32
+        >>> output = model(matrix_input, scalar_input, constraints)  # shape: (32, 50)
     """
     model = GPT2LikeTransformer(
         past_window_size=past_window_size,
@@ -813,35 +838,35 @@ def k_ratio(portfolio_price_timeseries):
     # K-ratio = slope * sqrt(R-squared) * sqrt(n) (negative for PyTorch minimization - higher K-ratio is better)
     return -(slope * torch.sqrt(r_squared) * torch.sqrt(torch.tensor(n, dtype=torch.float32)))
 #------------ Custom Loss Function -----------
-def portfolio_regularization_loss(weights: torch.Tensor, max_weight: float = 0.5, 
-                                 sparsity_lambda: float = 0.01, concentration_lambda: float = 0.01) -> torch.Tensor:
-    """
-    Calculate regularization losses for portfolio constraints.
+# def portfolio_regularization_loss(weights: torch.Tensor, max_weight: float = 0.5, 
+#                                  sparsity_lambda: float = 0.01, concentration_lambda: float = 0.01) -> torch.Tensor:
+#     """
+#     Calculate regularization losses for portfolio constraints.
     
-    Args:
-        weights: Portfolio weights tensor of shape (batch_size, n_assets)
-        max_weight: Maximum allowed weight for any asset
-        sparsity_lambda: Weight for sparsity regularization (encourages fewer assets)
-        concentration_lambda: Weight for concentration penalty (discourages max weight violations)
+#     Args:
+#         weights: Portfolio weights tensor of shape (batch_size, n_assets)
+#         max_weight: Maximum allowed weight for any asset
+#         sparsity_lambda: Weight for sparsity regularization (encourages fewer assets)
+#         concentration_lambda: Weight for concentration penalty (discourages max weight violations)
     
-    Returns:
-        Total regularization loss
-    """
-    batch_size, n_assets = weights.shape
+#     Returns:
+#         Total regularization loss
+#     """
+#     batch_size, n_assets = weights.shape
     
-    # Sparsity regularization - L1 penalty to encourage sparse portfolios
-    sparsity_loss = sparsity_lambda * torch.sum(torch.abs(weights), dim=1).mean()
+#     # Sparsity regularization - L1 penalty to encourage sparse portfolios
+#     sparsity_loss = sparsity_lambda * torch.sum(torch.abs(weights), dim=1).mean()
     
-    # Concentration penalty - penalize weights above max_weight
-    excess_weights = torch.clamp(weights - max_weight, min=0.0)
-    concentration_loss = concentration_lambda * torch.sum(excess_weights ** 2, dim=1).mean()
+#     # Concentration penalty - penalize weights above max_weight
+#     excess_weights = torch.clamp(weights - max_weight, min=0.0)
+#     concentration_loss = concentration_lambda * torch.sum(excess_weights ** 2, dim=1).mean()
     
-    # Asset count penalty (alternative approach)
-    # Count non-zero weights and penalize if too many
-    non_zero_counts = (weights > 0.01).float().sum(dim=1)  # Count weights > 1%
-    count_penalty = 0.001 * torch.clamp(non_zero_counts - 20, min=0.0).mean()  # Penalize > 20 assets
+#     # Asset count penalty (alternative approach)
+#     # Count non-zero weights and penalize if too many
+#     non_zero_counts = (weights > 0.01).float().sum(dim=1)  # Count weights > 1%
+#     count_penalty = 0.001 * torch.clamp(non_zero_counts - 20, min=0.0).mean()  # Penalize > 20 assets
     
-    return sparsity_loss + concentration_loss + count_penalty
+#     return sparsity_loss + concentration_loss + count_penalty
 
 
 def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
@@ -879,11 +904,85 @@ def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
     # Call the appropriate metric function
     return metric_functions[metric](x_pred, *args, **kwargs)
 
-def training_loop():
-    return 0
+def predict_portfolio_weights(model, matrix_input, future_window_size=20, 
+                             max_weight=1.0, min_assets=0, max_assets=1000, 
+                             sparsity_threshold=0.01):
+    """
+    Make portfolio weight predictions with user-specified prediction horizon and constraints.
+    
+    Args:
+        model: Trained GPT2LikeTransformer model
+        matrix_input: Price data tensor of shape (batch_size, n_assets, past_window_size)
+        future_window_size: Number of timesteps to predict for (prediction horizon)
+        max_weight: Maximum weight for any single asset (0.0-1.0, default 1.0 = unconstrained)
+        min_assets: Minimum number of assets to hold (default 0 = unconstrained)
+        max_assets: Maximum number of assets to hold (default 1000 = unconstrained)
+        sparsity_threshold: Threshold below which weights are set to 0 (0.0-1.0)
+    
+    Returns:
+        Portfolio weights tensor of shape (batch_size, n_assets)
+    
+    Example:
+        >>> # Load your trained model
+        >>> model = torch.load('trained_model.pth')
+        >>> model.eval()
+        >>> 
+        >>> # Prepare price data (normalized)
+        >>> price_data = torch.randn(1, 100, 20)  # 1 sample, 100 assets, 20 timesteps
+        >>> 
+        >>> # Make prediction with custom horizon and constraints
+        >>> weights = predict_portfolio_weights(
+        ...     model=model,
+        ...     matrix_input=price_data,
+        ...     future_window_size=30,  # Predict 30 days ahead
+        ...     max_weight=0.3,         # Max 30% in any asset
+        ...     min_assets=10,          # Hold at least 10 assets
+        ...     max_assets=25,          # Hold at most 25 assets
+        ...     sparsity_threshold=0.02 # Ignore weights below 2%
+        ... )
+        >>> 
+        >>> # Unconstrained prediction with different horizon
+        >>> unconstrained_weights = predict_portfolio_weights(
+        ...     model=model,
+        ...     matrix_input=price_data,
+        ...     future_window_size=5    # Short-term prediction
+        ...     # All constraints use defaults (unconstrained)
+        ... )
+        >>> 
+        >>> print(f"Portfolio weights: {weights}")
+        >>> print(f"Number of assets held: {(weights > 0.01).sum().item()}")
+        >>> print(f"Max weight: {weights.max().item():.3f}")
+    """
+    model.eval()
+    
+    with torch.no_grad():
+        batch_size, n_assets, _ = matrix_input.shape
+        
+        # Scalar input: future window size (prediction horizon)
+        scalar_input = torch.tensor(future_window_size, dtype=torch.float32, device=matrix_input.device)
+        scalar_input = scalar_input.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1)  # (batch_size, 1)
+        
+        # Constraint input: portfolio constraints
+        # Ensure max_assets doesn't exceed actual number of assets
+        effective_max_assets = min(max_assets, n_assets)
+        
+        constraint_vector = torch.tensor([
+            max_weight,  # Max weight (0-1, where 1.0 = unconstrained)
+            min_assets / 100.0,  # Normalize min assets (0 = unconstrained)
+            effective_max_assets / 100.0,  # Normalize max assets
+            sparsity_threshold * 100.0  # Scale sparsity threshold (0.01 -> 1.0)
+        ], dtype=torch.float32, device=matrix_input.device)
+        
+        # Expand constraint vector to batch size
+        constraint_input = constraint_vector.unsqueeze(0).repeat(batch_size, 1)  # (batch_size, 4)
+        
+        # Make prediction
+        weights = model(matrix_input, scalar_input, constraint_input)
+        
+        return weights
 
 def update_model(model, optimizer, past_batch, future_batch, metric, 
-                max_weight=None, min_assets=None, max_assets=None, sparsity_threshold=0.01,
+                max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
                 regularization_lambda=0.0, *args, **kwargs):
     """
     Perform forward and backward pass to update the model.
@@ -893,14 +992,15 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
         optimizer: PyTorch optimizer (e.g., Adam, SGD)
         past_batch: Dictionary containing past data for model input:
             - 'matrix_input': Tensor of shape (batch_size, n, past_window_size)
-            - 'scalar_input': Tensor of shape (batch_size, 1)
+            - 'scalar_input': Tensor of shape (batch_size, 1) containing future_window_size
+            - 'constraint_input': Tensor of shape (batch_size, 4) containing constraints
         future_batch: Dictionary containing future data for loss calculation:
             - 'returns': Future returns matrix for portfolio evaluation
         metric: String name of the metric to optimize (e.g., 'sharpe_ratio')
-        max_weight: Maximum weight constraint for portfolio
-        min_assets: Minimum number of assets constraint
-        max_assets: Maximum number of assets constraint
-        sparsity_threshold: Threshold for setting small weights to zero
+        max_weight: Maximum weight constraint (1.0 = unconstrained, used for regularization loss)
+        min_assets: Minimum number of assets constraint (0 = unconstrained, used for regularization loss)
+        max_assets: Maximum number of assets constraint (1000 = unconstrained, used for regularization loss)
+        sparsity_threshold: Threshold for setting small weights to zero (used for regularization loss)
         regularization_lambda: Weight for portfolio regularization loss
         *args, **kwargs: Additional arguments passed to metric calculation
     
@@ -917,16 +1017,10 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
     # Extract inputs from past_batch
     matrix_input = past_batch['matrix_input']
     scalar_input = past_batch['scalar_input']
+    constraint_input = past_batch['constraint_input']
     
-    # Forward pass through model with constraints
-    weights = model(
-        matrix_input, 
-        scalar_input, 
-        max_weight=max_weight,
-        min_assets=min_assets, 
-        max_assets=max_assets,
-        sparsity_threshold=sparsity_threshold
-    )
+    # Forward pass through model (future window and constraints are now separate inputs)
+    weights = model(matrix_input, scalar_input, constraint_input)
     
     # Extract future returns for portfolio evaluation
     future_returns = future_batch['returns']  # Shape: (timesteps, n_assets)
@@ -946,18 +1040,14 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
     # Average metric loss across batch
     metric_loss = torch.stack(metric_losses).mean()
     
-    # Calculate regularization loss if requested
+    # Calculate regularization loss if requested (currently disabled)
     reg_loss = torch.tensor(0.0, device=weights.device)
-    if regularization_lambda > 0.0:
-        reg_loss = portfolio_regularization_loss(
-            weights, 
-            max_weight=max_weight or 0.5,
-            sparsity_lambda=regularization_lambda * 0.1,
-            concentration_lambda=regularization_lambda * 0.1
-        )
+    # TODO: Implement portfolio_regularization_loss if needed
+    # if regularization_lambda > 0.0:
+    #     reg_loss = portfolio_regularization_loss(weights, ...)
     
-    # Total loss
-    total_loss = metric_loss + regularization_lambda * reg_loss
+    # Total loss (currently just metric loss)
+    total_loss = metric_loss  # + regularization_lambda * reg_loss
     
     # Backward pass
     total_loss.backward()
