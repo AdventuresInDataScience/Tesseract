@@ -89,45 +89,20 @@ conservative_constraints = {
     'sparsity_threshold': 0.005  # 0.5% threshold for inclusion
 }
 
-# Get recent data for prediction - handle NaN values and object types properly
-print("Data preprocessing...")
+# Prepare data for prediction - the function now handles data cleaning automatically
+print("Using cleaned DataFrame for prediction...")
 print(f"Original timeseries shape: {timeseries.shape}")
 print(f"Original timeseries dtype: {timeseries.dtype}")
 
-# Convert to DataFrame to handle data cleaning properly
-df_clean = pd.DataFrame(timeseries)
+# Convert to DataFrame for easier handling (the function will handle all the cleaning)
+df_for_prediction = pd.DataFrame(timeseries)
 
-# Convert object columns to numeric, coercing errors to NaN
-for col in df_clean.columns:
-    if df_clean[col].dtype == 'object':
-        df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-
-# Drop columns that are all NaN
-df_clean = df_clean.dropna(axis=1, how='all')
-
-# Forward fill and backward fill to handle remaining NaN values
-df_clean = df_clean.fillna(method='ffill').fillna(method='bfill')
-
-# If still have NaN values, drop those columns
-df_clean = df_clean.dropna(axis=1, how='any')
-
-print(f"Cleaned data shape: {df_clean.shape}")
-
-# Get recent data for prediction
-recent_data = df_clean.iloc[-past_window_size:, :50].values  # Last 30 days, first 50 assets
-
-print(f"Recent data shape: {recent_data.shape}")
-print(f"Recent data dtype: {recent_data.dtype}")
-print(f"Has NaN: {np.isnan(recent_data).any()}")
-
-# Convert to tensor format: (batch_size, n_assets, past_window_size)
-matrix_input = torch.tensor(recent_data.T, dtype=torch.float32).unsqueeze(0)  # (1, n_assets, 30)
-print(f"Matrix input shape: {matrix_input.shape}")
-
+# Use the predict_portfolio_weights function with automatic data handling
 portfolio_weights = predict_portfolio_weights(
     model=trained_model,
-    matrix_input=matrix_input,
+    data_input=df_for_prediction,  # Pandas DataFrame - automatically handled
     future_window_size=future_window_size,
+    max_assets_subset=50,  # Use only first 50 assets
     **conservative_constraints
 )
 
@@ -144,10 +119,12 @@ aggressive_constraints = {
     'sparsity_threshold': 0.02  # 2% threshold for inclusion
 }
 
+# Use the same DataFrame for aggressive prediction
 portfolio_weights_aggressive = predict_portfolio_weights(
     model=trained_model,
-    matrix_input=matrix_input,
+    data_input=df_for_prediction,  # Same DataFrame - automatically handled
     future_window_size=future_window_size,
+    max_assets_subset=50,  # Use only first 50 assets
     **aggressive_constraints
 )
 

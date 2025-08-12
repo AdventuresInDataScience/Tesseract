@@ -904,58 +904,142 @@ def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
     # Call the appropriate metric function
     return metric_functions[metric](x_pred, *args, **kwargs)
 
-def predict_portfolio_weights(model, matrix_input, future_window_size=20, 
+def predict_portfolio_weights(model, data_input, future_window_size=20, 
                              max_weight=1.0, min_assets=0, max_assets=1000, 
-                             sparsity_threshold=0.01):
+                             sparsity_threshold=0.01, max_assets_subset=None):
     """
     Make portfolio weight predictions with user-specified prediction horizon and constraints.
+    Automatically handles pandas DataFrames, numpy arrays, and torch tensors as input.
     
     Args:
         model: Trained GPT2LikeTransformer model
-        matrix_input: Price data tensor of shape (batch_size, n_assets, past_window_size)
+        data_input: Price data in one of the following formats:
+            - torch.Tensor: Shape (batch_size, n_assets, past_window_size) - used directly
+            - pandas.DataFrame: Rows are timesteps, columns are assets - uses last past_window_size rows
+            - numpy.ndarray: Shape (timesteps, n_assets) - uses last past_window_size rows
         future_window_size: Number of timesteps to predict for (prediction horizon)
         max_weight: Maximum weight for any single asset (0.0-1.0, default 1.0 = unconstrained)
         min_assets: Minimum number of assets to hold (default 0 = unconstrained)
         max_assets: Maximum number of assets to hold (default 1000 = unconstrained)
         sparsity_threshold: Threshold below which weights are set to 0 (0.0-1.0)
+        max_assets_subset: If provided, only use the first N assets from the input data
     
     Returns:
         Portfolio weights tensor of shape (batch_size, n_assets)
     
     Example:
-        >>> # Load your trained model
-        >>> model = torch.load('trained_model.pth')
-        >>> model.eval()
-        >>> 
-        >>> # Prepare price data (normalized)
-        >>> price_data = torch.randn(1, 100, 20)  # 1 sample, 100 assets, 20 timesteps
-        >>> 
-        >>> # Make prediction with custom horizon and constraints
+        >>> # Using pandas DataFrame (most common case)
+        >>> df = pd.read_parquet("stock_prices.parquet")  # Rows=timesteps, Cols=assets
         >>> weights = predict_portfolio_weights(
-        ...     model=model,
-        ...     matrix_input=price_data,
-        ...     future_window_size=30,  # Predict 30 days ahead
-        ...     max_weight=0.3,         # Max 30% in any asset
-        ...     min_assets=10,          # Hold at least 10 assets
-        ...     max_assets=25,          # Hold at most 25 assets
-        ...     sparsity_threshold=0.02 # Ignore weights below 2%
+        ...     model=trained_model,
+        ...     data_input=df,  # Automatically uses last 30 rows (past_window_size)
+        ...     future_window_size=30,
+        ...     max_weight=0.3,
+        ...     max_assets_subset=50  # Only use first 50 assets
         ... )
         >>> 
-        >>> # Unconstrained prediction with different horizon
-        >>> unconstrained_weights = predict_portfolio_weights(
-        ...     model=model,
-        ...     matrix_input=price_data,
-        ...     future_window_size=5    # Short-term prediction
-        ...     # All constraints use defaults (unconstrained)
+        >>> # Using numpy array
+        >>> numpy_data = df.values  # Shape: (timesteps, n_assets)
+        >>> weights = predict_portfolio_weights(
+        ...     model=trained_model,
+        ...     data_input=numpy_data,
+        ...     future_window_size=5
         ... )
         >>> 
-        >>> print(f"Portfolio weights: {weights}")
-        >>> print(f"Number of assets held: {(weights > 0.01).sum().item()}")
-        >>> print(f"Max weight: {weights.max().item():.3f}")
+        >>> # Using pre-prepared tensor (original behavior)
+        >>> tensor_data = torch.randn(1, 100, 20)  # (batch_size, n_assets, past_window_size)
+        >>> weights = predict_portfolio_weights(
+        ...     model=trained_model,
+        ...     data_input=tensor_data,
+        ...     future_window_size=10
+        ... )
     """
     model.eval()
     
     with torch.no_grad():
+        # Handle different input types and convert to required tensor format
+        if isinstance(data_input, torch.Tensor):
+            # Already a tensor - use directly
+            matrix_input = data_input
+            if len(matrix_input.shape) == 2:
+                # If 2D (timesteps, n_assets), assume single batch and transpose
+                # Take last past_window_size timesteps
+                past_window_size = model.past_window_size
+                recent_data = matrix_input[-past_window_size:, :]  # (past_window_size, n_assets)
+                matrix_input = recent_data.T.unsqueeze(0)  # (1, n_assets, past_window_size)
+            
+        elif isinstance(data_input, pd.DataFrame):
+            # Pandas DataFrame - convert to tensor
+            # Handle data cleaning
+            df_clean = data_input.copy()
+            
+            # Convert object columns to numeric, coercing errors to NaN
+            for col in df_clean.columns:
+                if df_clean[col].dtype == 'object':
+                    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+            
+            # Drop columns that are all NaN
+            df_clean = df_clean.dropna(axis=1, how='all')
+            
+            # Forward fill and backward fill to handle remaining NaN values
+            df_clean = df_clean.fillna(method='ffill').fillna(method='bfill')
+            
+            # If still have NaN values, drop those columns
+            df_clean = df_clean.dropna(axis=1, how='any')
+            
+            # Apply asset subset if requested
+            if max_assets_subset is not None:
+                df_clean = df_clean.iloc[:, :max_assets_subset]
+            
+            # Get recent data for prediction
+            past_window_size = model.past_window_size
+            recent_data = df_clean.iloc[-past_window_size:, :].values  # (past_window_size, n_assets)
+            
+            # Convert to tensor format: (batch_size, n_assets, past_window_size)
+            matrix_input = torch.tensor(recent_data.T, dtype=torch.float32).unsqueeze(0)  # (1, n_assets, past_window_size)
+            
+        elif isinstance(data_input, np.ndarray):
+            # Numpy array - convert to tensor
+            # Handle data cleaning
+            data_array = data_input.copy()
+            
+            # Convert to DataFrame for cleaning, then back to numpy
+            df_temp = pd.DataFrame(data_array)
+            
+            # Convert object columns to numeric, coercing errors to NaN
+            for col in df_temp.columns:
+                if df_temp[col].dtype == 'object':
+                    df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce')
+            
+            # Drop columns that are all NaN
+            df_temp = df_temp.dropna(axis=1, how='all')
+            
+            # Forward fill and backward fill to handle remaining NaN values
+            df_temp = df_temp.fillna(method='ffill').fillna(method='bfill')
+            
+            # If still have NaN values, drop those columns
+            df_temp = df_temp.dropna(axis=1, how='any')
+            
+            # Apply asset subset if requested
+            if max_assets_subset is not None:
+                df_temp = df_temp.iloc[:, :max_assets_subset]
+            
+            # Get recent data for prediction
+            past_window_size = model.past_window_size
+            recent_data = df_temp.iloc[-past_window_size:, :].values  # (past_window_size, n_assets)
+            
+            # Convert to tensor format: (batch_size, n_assets, past_window_size)
+            matrix_input = torch.tensor(recent_data.T, dtype=torch.float32).unsqueeze(0)  # (1, n_assets, past_window_size)
+            
+        else:
+            raise TypeError(f"Unsupported data_input type: {type(data_input)}. "
+                          f"Expected torch.Tensor, pandas.DataFrame, or numpy.ndarray")
+        
+        # Validate tensor shape
+        if len(matrix_input.shape) != 3:
+            raise ValueError(f"matrix_input must have 3 dimensions (batch_size, n_assets, past_window_size), "
+                           f"got shape: {matrix_input.shape}")
+        
         batch_size, n_assets, _ = matrix_input.shape
         
         # Scalar input: future window size (prediction horizon)
