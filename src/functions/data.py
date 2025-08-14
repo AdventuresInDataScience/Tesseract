@@ -22,7 +22,10 @@ which would unbalance the samples.
 # Clean solution using your original approach:
 import torch
 import numpy as np
+import pandas as pd
 import random
+import os
+from datetime import datetime
 from model import update_model
 
 def create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices, max_retries=10):
@@ -132,10 +135,12 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
 
 def train_model(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
-                       metric ='sharpe_ratio', 
+                       metric ='sharpe_ratio', loss_aggregation='gmse',
                        # Constraint ranges for random sampling
                        max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
-                       max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05)):
+                       max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
+                       # Logging and checkpoint paths
+                       log_path=None, checkpoint_path=None):
     """
     Progressive batch creation with curriculum learning and random constraint sampling.
     Starts with small batch_size and n_cols, gradually increases both.
@@ -150,17 +155,73 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         min_batch_size: Starting batch size
         max_batch_size: Final batch size
         iterations: Total number of iterations
-        metric: Metric to optimize
+        metric: Metric to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
+        loss_aggregation: Method to aggregate losses across batch
+            - 'mae': Mean Absolute Error - arithmetic mean
+            - 'mse': Mean Square Error - mean of squared losses  
+            - 'gmae': Geometric Mean Absolute Error - log-space geometric mean
+            - 'gmse': Geometric Mean Square Error (default, user's proposed method)
         max_weight_range: (min, max) range for max_weight constraint sampling
         min_assets_range: (min, max) range for min_assets constraint sampling  
         max_assets_range: (min, max) range for max_assets constraint sampling
         sparsity_threshold_range: (min, max) range for sparsity_threshold sampling
+        log_path: Path to save training logs (default: repo_root/logs/)
+        checkpoint_path: Path to save model checkpoints (default: repo_root/checkpoints/)
         
     Returns:
         Trained model
+        
+    Example:
+        >>> # Train with custom paths
+        >>> trained_model = train_model(
+        ...     model=model, 
+        ...     optimizer=optimizer, 
+        ...     data=df, 
+        ...     past_window_size=20, 
+        ...     future_window_size=10,
+        ...     metric='sharpe_ratio',
+        ...     loss_aggregation='gmse',
+        ...     log_path='/path/to/custom/logs',
+        ...     checkpoint_path='/path/to/custom/checkpoints'
+        ... )
+        >>> 
+        >>> # Train with default paths (repo_root/logs/ and repo_root/checkpoints/)
+        >>> trained_model = train_model(
+        ...     model=model, 
+        ...     optimizer=optimizer, 
+        ...     data=df, 
+        ...     past_window_size=20, 
+        ...     future_window_size=10,
+        ...     metric='geometric_sharpe_ratio',
+        ...     loss_aggregation='mae'
+        ... )
     """
-    # Set model to train mode
-    model.train()
+    # start time
+    start_time = datetime.now()
+    print("Training started at", start_time)
+
+    # Set up default paths if not provided
+    if log_path is None:
+        # Get the repository root (assuming this file is in src/functions/)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(os.path.dirname(current_dir))  # Go up two levels from src/functions/
+        log_path = os.path.join(repo_root, "logs")
+    
+    if checkpoint_path is None:
+        # Get the repository root (assuming this file is in src/functions/)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(os.path.dirname(current_dir))  # Go up two levels from src/functions/
+        checkpoint_path = os.path.join(repo_root, "checkpoints")
+    
+    # Create directories if they don't exist
+    os.makedirs(log_path, exist_ok=True)
+    os.makedirs(checkpoint_path, exist_ok=True)
+    
+    print(f"Logs will be saved to: {log_path}")
+    print(f"Model checkpoints will be saved to: {checkpoint_path}")
+
+    # Create log
+    log = pd.DataFrame(columns=['iteration', 'loss'])
 
     # Convert DataFrame to numpy array if needed
     if hasattr(data, 'values'):  # Check if it's a DataFrame
@@ -232,9 +293,44 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         
         # Temp output example
         # print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch_tensor.shape}, {future_batch_tensor.shape})")
-        update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
-                     max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold)
+        loss_dict = update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
+                     max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold,
+                     loss_aggregation=loss_aggregation)
 
+        # every 50 iterations, save weights and log losses
+        if (i + 1) % 50 == 0:
+            print(f"Saving model at iteration {i + 1}")
+            checkpoint_filename = f'model_checkpoint_{i + 1}.pt'
+            checkpoint_filepath = os.path.join(checkpoint_path, checkpoint_filename)
+            torch.save(model.state_dict(), checkpoint_filepath)
+            print(f"Model checkpoint saved to: {checkpoint_filepath}")
+            
+            # Log the loss for this checkpoint
+            new_row = pd.DataFrame({'iteration': [i + 1], 'loss': [loss_dict['loss']]})
+            log = pd.concat([log, new_row], ignore_index=True)
+
+    # Save final complete model (architecture + weights)
+    final_model_filename = 'final_trained_model.pt'
+    final_model_filepath = os.path.join(checkpoint_path, final_model_filename)
+    torch.save(model, final_model_filepath)
+    print(f"Complete final model saved to: {final_model_filepath}")
+    
+    # Also save final state dict for compatibility
+    final_state_dict_filename = 'final_model_state_dict.pt'
+    final_state_dict_filepath = os.path.join(checkpoint_path, final_state_dict_filename)
+    torch.save(model.state_dict(), final_state_dict_filepath)
+    print(f"Final model state dict saved to: {final_state_dict_filepath}")
+
+    # Save final log to CSV with datetime filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'training_log_{timestamp}.csv'
+    log_filepath = os.path.join(log_path, log_filename)
+    log.to_csv(log_filepath, index=False)
+    print(f"Training log saved to: {log_filepath}")
+
+    end_time = datetime.now()
+    print("Training completed at", end_time)
+    print(f"Total training time: {end_time - start_time}")
     return model
 
 #%%

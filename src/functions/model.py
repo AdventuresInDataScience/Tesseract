@@ -451,6 +451,148 @@ def create_adam_optimizer(model, lr=1e-4, weight_decay=1e-5, betas=(0.9, 0.999),
     )
 
 
+#------------ Model Saving and Loading Functions -----------
+def save_complete_model(model, filepath, model_config=None):
+    """
+    Save complete model (architecture + weights) and configuration.
+    
+    Args:
+        model: The trained model to save
+        filepath: Path where to save the model (should end with .pt)
+        model_config: Optional dictionary with model configuration parameters
+    
+    Example:
+        >>> config = {
+        ...     'past_window_size': 30,
+        ...     'd_model': 256,
+        ...     'n_heads': 8,
+        ...     'n_transformer_blocks': 6
+        ... }
+        >>> save_complete_model(model, 'my_model.pt', config)
+    """
+    from datetime import datetime
+    
+    save_data = {
+        'model': model,
+        'model_state_dict': model.state_dict(),
+        'model_config': model_config or {},
+        'save_timestamp': datetime.now().isoformat()
+    }
+    
+    torch.save(save_data, filepath)
+    print(f"Complete model and configuration saved to: {filepath}")
+
+
+def load_complete_model(filepath, device='cpu'):
+    """
+    Load complete model (architecture + weights) and configuration.
+    
+    Args:
+        filepath: Path to the saved model file
+        device: Device to load the model on ('cpu', 'cuda', etc.)
+    
+    Returns:
+        tuple: (model, model_config) - loaded model and its configuration
+    
+    Example:
+        >>> model, config = load_complete_model('my_model.pt')
+        >>> print(f"Model has {config['past_window_size']} past window size")
+        >>> weights = predict_portfolio_weights(model, data, future_window_size=5)
+    """
+    checkpoint = torch.load(filepath, map_location=device)
+    
+    model = checkpoint['model']
+    model_config = checkpoint.get('model_config', {})
+    
+    # Ensure model is on the correct device
+    model = model.to(device)
+    model.eval()  # Set to evaluation mode
+    
+    print(f"Model loaded from: {filepath}")
+    print(f"Save timestamp: {checkpoint.get('save_timestamp', 'Unknown')}")
+    print(f"Model configuration: {model_config}")
+    
+    return model, model_config
+
+
+def load_model_from_checkpoint(model_architecture, checkpoint_path, device='cpu'):
+    """
+    Load model weights from a checkpoint into an existing model architecture.
+    Use this when you want to recreate the model architecture manually.
+    
+    Args:
+        model_architecture: The model architecture (created with build_transformer_model)
+        checkpoint_path: Path to the checkpoint file (state_dict)
+        device: Device to load the model on
+    
+    Returns:
+        model: Model with loaded weights
+    
+    Example:
+        >>> # Recreate the same architecture
+        >>> model = build_transformer_model(past_window_size=30, d_model=256)
+        >>> # Load trained weights
+        >>> model = load_model_from_checkpoint(model, 'model_checkpoint_200.pt')
+        >>> weights = predict_portfolio_weights(model, data, future_window_size=5)
+    """
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    model_architecture.load_state_dict(state_dict)
+    model_architecture = model_architecture.to(device)
+    model_architecture.eval()
+    
+    print(f"Model weights loaded from checkpoint: {checkpoint_path}")
+    return model_architecture
+
+
+def save_model_config(model, config_path):
+    """
+    Save model configuration parameters to a JSON file.
+    
+    Args:
+        model: The model to extract configuration from
+        config_path: Path to save the configuration (should end with .json)
+    
+    Example:
+        >>> save_model_config(model, 'model_config.json')
+    """
+    import json
+    from datetime import datetime
+    
+    config = {
+        'past_window_size': getattr(model, 'past_window_size', None),
+        'd_model': getattr(model, 'd_model', None),
+        'n_layers': getattr(model, 'n_layers', None),
+        'causal': getattr(model, 'causal', None),
+        'model_class': model.__class__.__name__,
+        'total_parameters': model.get_num_parameters() if hasattr(model, 'get_num_parameters') else None,
+        'save_timestamp': datetime.now().isoformat()
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"Model configuration saved to: {config_path}")
+
+
+def load_model_config(config_path):
+    """
+    Load model configuration from a JSON file.
+    
+    Args:
+        config_path: Path to the configuration file
+    
+    Returns:
+        dict: Model configuration parameters
+    """
+    import json
+    
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    print(f"Model configuration loaded from: {config_path}")
+    return config
+
+
 #--------------Time series from Portfolio and weights Functions--------------
 def create_portfolio_time_series(stocks_matrix, weights_vector):
     """
@@ -1065,9 +1207,91 @@ def predict_portfolio_weights(model, data_input, future_window_size=20,
         
         return weights
 
+def mean_square_error_aggregation(losses):
+    """
+    Calculate Mean Square Error (MSE) aggregation.
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses
+    
+    Returns:
+        Mean of squared losses
+    """
+    return torch.mean(losses ** 2)
+
+
+def geometric_mean_absolute_error_aggregation(losses, epsilon=1e-8):
+    """
+    Aggregate losses using geometric mean absolute error with numerical stability.
+    
+    This uses log-space operations for numerical stability when computing geometric means.
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses
+        epsilon: Small constant for numerical stability
+    
+    Returns:
+        Geometric mean of absolute losses using log-space operations
+    
+    Mathematical approach:
+    geometric_mean = exp(mean(log(abs(losses) + epsilon)))
+    But implemented using logsumexp for numerical stability.
+    """
+    batch_size = losses.shape[0]
+    
+    # Take absolute value and add epsilon for numerical stability
+    abs_losses = torch.abs(losses) + epsilon
+    
+    # Geometric mean using log-space operations (numerically stable)
+    # log(geometric_mean) = mean(log(values)) = (sum(log(values))) / n
+    # geometric_mean = exp(mean(log(values)))
+    log_geometric_mean = torch.logsumexp(torch.log(abs_losses), dim=0) - torch.log(torch.tensor(batch_size, dtype=torch.float32))
+    
+    # Convert back from log space and preserve original sign
+    result = torch.exp(log_geometric_mean)
+    original_sign = torch.sign(losses.mean())
+    
+    return original_sign * result
+
+
+def geometric_mean_square_error_aggregation(losses):
+    """
+    Implement Geometric Mean Square Error (GMSE) as you described.
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses
+    
+    Returns:
+        Geometric mean of squared losses, then square rooted
+        
+    This is: sqrt((prod(losses^2))^(1/n))
+    Which is equivalent to: (prod(|losses|))^(1/n) with sign preservation
+    """
+    batch_size = losses.shape[0]
+    
+    # Square the losses to ensure positivity
+    squared_losses = losses ** 2
+    
+    # Add small epsilon to prevent log(0)
+    epsilon = 1e-8
+    squared_losses = squared_losses + epsilon
+    
+    # Geometric mean of squared losses using log-space for stability
+    # log(geometric_mean) = mean(log(values))
+    log_geometric_mean_squared = torch.logsumexp(torch.log(squared_losses), dim=0) - torch.log(torch.tensor(batch_size, dtype=torch.float32))
+    
+    # Take square root: sqrt(exp(log_geometric_mean_squared)) = exp(0.5 * log_geometric_mean_squared)
+    result = torch.exp(0.5 * log_geometric_mean_squared)
+    
+    # Preserve the sign from the original mean
+    original_sign = torch.sign(losses.mean())
+    
+    return original_sign * result
+
+
 def update_model(model, optimizer, past_batch, future_batch, metric, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
-                regularization_lambda=0.0, *args, **kwargs):
+                regularization_lambda=0.0, loss_aggregation='arithmetic', *args, **kwargs):
     """
     Perform forward and backward pass to update the model.
     
@@ -1086,6 +1310,11 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
         max_assets: Maximum number of assets constraint (1000 = unconstrained, used for regularization loss)
         sparsity_threshold: Threshold for setting small weights to zero (used for regularization loss)
         regularization_lambda: Weight for portfolio regularization loss
+        loss_aggregation: Method to aggregate losses across batch:
+            - 'mae' or 'arithmetic': Mean Absolute Error - arithmetic mean (default)
+            - 'mse': Mean Square Error - mean of squared losses
+            - 'gmae' or 'geometric': Geometric Mean Absolute Error - log-space geometric mean
+            - 'gmse' or 'geometric_mse': Geometric Mean Square Error (user's proposed method)
         *args, **kwargs: Additional arguments passed to metric calculation
     
     Returns:
@@ -1121,8 +1350,26 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
         metric_loss = calculate_expected_metric(portfolio_timeseries, None, metric, *args, **kwargs)
         metric_losses.append(metric_loss)
     
-    # Average metric loss across batch
-    metric_loss = torch.stack(metric_losses).mean()
+    # Stack all losses
+    stacked_losses = torch.stack(metric_losses)
+    
+    # Apply the selected aggregation method (passed as parameter)
+    if loss_aggregation == 'mae' or loss_aggregation == 'arithmetic':
+        # Mean Absolute Error: Standard arithmetic mean (backward compatibility)
+        metric_loss = stacked_losses.mean()
+    elif loss_aggregation == 'mse':
+        # Mean Square Error: Mean of squared losses
+        metric_loss = mean_square_error_aggregation(stacked_losses)
+    elif loss_aggregation == 'gmae' or loss_aggregation == 'geometric':
+        # Geometric Mean Absolute Error: Using log-space operations (numerically stable)
+        metric_loss = geometric_mean_absolute_error_aggregation(stacked_losses)
+    elif loss_aggregation == 'gmse' or loss_aggregation == 'geometric_mse':
+        # Geometric Mean Square Error (default, user's proposed method)
+        metric_loss = geometric_mean_square_error_aggregation(stacked_losses)
+    else:
+        # Fallback to arithmetic mean
+        metric_loss = stacked_losses.mean()
+        print(f"Warning: Unknown loss_aggregation method '{loss_aggregation}', using MAE (arithmetic mean)")
     
     # Calculate regularization loss if requested (currently disabled)
     reg_loss = torch.tensor(0.0, device=weights.device)
