@@ -2,9 +2,83 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import pandas as pd
 import numpy as np
+
+#------------ Activation Function Factory -----------
+def get_activation_function(activation: Union[str, nn.Module]) -> nn.Module:
+    """
+    Get activation function by name or return the module if already provided.
+    
+    Args:
+        activation: Either a string name or a PyTorch activation module
+        
+    Returns:
+        PyTorch activation module
+        
+    Available activations:
+        - 'relu': Standard ReLU
+        - 'relu6': ReLU clamped to [0, 6] (CPU-optimized)
+        - 'leaky_relu': LeakyReLU with negative_slope=0.01
+        - 'elu': Exponential Linear Unit
+        - 'selu': Scaled Exponential Linear Unit
+        - 'gelu': Gaussian Error Linear Unit (Transformer standard)
+        - 'swish' or 'silu': Swish/SiLU activation
+        - 'mish': Mish activation (modern, smooth)
+        - 'hard_swish': Hard Swish (mobile-optimized)
+        - 'hard_mish': Hard Mish (computational proxy)
+        - 'hard_gelu': Hard GELU (computational proxy)
+        - 'prelu': Parametric ReLU (learnable)
+        - 'glu': Gated Linear Unit
+        - 'tanh': Hyperbolic tangent
+        - 'sigmoid': Sigmoid activation
+    
+    Example:
+        >>> act = get_activation_function('mish')
+        >>> act = get_activation_function('hard_swish')
+        >>> act = get_activation_function(torch.nn.ReLU())  # Pass module directly
+    """
+    if isinstance(activation, nn.Module):
+        return activation
+    
+    activation = activation.lower().strip()
+    
+    activation_map = {
+        # Standard activations
+        'relu': nn.ReLU(),
+        'relu6': nn.ReLU6(),
+        'leaky_relu': nn.LeakyReLU(negative_slope=0.01),
+        'elu': nn.ELU(),
+        'selu': nn.SELU(),
+        
+        # Transformer standard
+        'gelu': nn.GELU(),
+        
+        # Modern smooth activations
+        'swish': nn.SiLU(),  # Swish is same as SiLU
+        'silu': nn.SiLU(),
+        'mish': nn.Mish(),
+        
+        # Hard/computational proxy versions (faster)
+        'hard_swish': nn.Hardswish(),
+        'hard_mish': nn.Mish(),  # Using Mish as proxy since PyTorch doesn't have native HardMish
+        'hard_gelu': nn.GELU(approximate='tanh'),  # Tanh approximation of GELU
+        
+        # Parametric and gated
+        'prelu': nn.PReLU(),
+        'glu': nn.GLU(),
+        
+        # Classical
+        'tanh': nn.Tanh(),
+        'sigmoid': nn.Sigmoid(),
+    }
+    
+    if activation not in activation_map:
+        available = ', '.join(sorted(activation_map.keys()))
+        raise ValueError(f"Unknown activation '{activation}'. Available: {available}")
+    
+    return activation_map[activation]
 
 #------------ Model Components -----------
 class MultiHeadAttention(nn.Module):
@@ -83,15 +157,18 @@ class PositionalEncoding(nn.Module):
 class TransformerBlock(nn.Module):
     """Single transformer block with self-attention and feed-forward network."""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, causal: bool = True):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, causal: bool = True, activation='relu6'):
         super().__init__()
         self.attention = MultiHeadAttention(d_model, n_heads, dropout, causal)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         
+        # Get activation function from factory
+        activation_fn = get_activation_function(activation)
+        
         self.feed_forward = nn.Sequential(
             nn.Linear(d_model, d_ff),
-            nn.GELU(),
+            activation_fn,  # Configurable activation function
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
             nn.Dropout(dropout)
@@ -114,11 +191,15 @@ class TransformerBlock(nn.Module):
 class IntermediateMLP(nn.Module):
     """Intermediate MLP layer between transformer blocks."""
     
-    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1, activation='relu6'):
         super().__init__()
+        
+        # Get activation function from factory
+        activation_fn = get_activation_function(activation)
+        
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_hidden),
-            nn.GELU(),
+            activation_fn,  # Configurable activation function
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_model),
             nn.Dropout(dropout)
@@ -151,7 +232,8 @@ class GPT2LikeTransformer(nn.Module):
         d_mlp_hidden: int = 2048,
         dropout: float = 0.1,
         max_n: int = 1000,
-        causal: bool = True
+        causal: bool = True,
+        activation='relu6'
     ):
         super().__init__()
         
@@ -159,6 +241,7 @@ class GPT2LikeTransformer(nn.Module):
         self.d_model = d_model
         self.n_layers = n_transformer_blocks
         self.causal = causal
+        self.activation = activation
         
         # Input projection for the matrix input (n x t -> n x d_model)
         self.input_projection = nn.Linear(past_window_size, d_model)
@@ -178,10 +261,10 @@ class GPT2LikeTransformer(nn.Module):
         
         for _ in range(n_transformer_blocks):
             self.transformer_blocks.append(
-                TransformerBlock(d_model, n_heads, d_ff, dropout, causal)
+                TransformerBlock(d_model, n_heads, d_ff, dropout, causal, activation)
             )
             self.intermediate_mlps.append(
-                IntermediateMLP(d_model, d_mlp_hidden, dropout)
+                IntermediateMLP(d_model, d_mlp_hidden, dropout, activation)
             )
         
         # Final layer norm
@@ -253,28 +336,36 @@ class GPT2LikeTransformer(nn.Module):
                 
                 # If too few assets, select top additional ones
                 if min_assets is not None and non_zero_count < min_assets:
-                    needed = min_assets - non_zero_count
-                    # Find indices of zero weights
-                    zero_indices = (w <= 1e-8).nonzero().squeeze(-1)
+                    # Safety check: ensure min_assets doesn't exceed available assets
+                    effective_min_assets = min(min_assets, n_assets)
+                    needed = effective_min_assets - non_zero_count
                     
-                    # Make sure we don't try to select more assets than available
-                    if len(zero_indices) >= needed:
-                        # Select top 'needed' assets from zero weights based on original logits
-                        original_scores = logits[i][zero_indices]
-                        _, top_indices = torch.topk(original_scores, needed)
-                        selected_indices = zero_indices[top_indices]
-                        # Give small positive weights (create new tensor instead of in-place)
-                        values = torch.full((len(selected_indices),), 0.01, device=w.device)
-                        w = w.scatter(0, selected_indices, values)
-                    else:
-                        # If we don't have enough zero weights, just use all available zero weights
-                        if len(zero_indices) > 0:
-                            values = torch.full((len(zero_indices),), 0.01, device=w.device)
-                            w = w.scatter(0, zero_indices, values)
+                    if needed > 0:  # Only proceed if we actually need more assets
+                        # Find indices of zero weights
+                        zero_indices = (w <= 1e-8).nonzero().squeeze(-1)
+                        
+                        # Make sure we don't try to select more assets than available
+                        if len(zero_indices) >= needed:
+                            # Select top 'needed' assets from zero weights based on original logits
+                            original_scores = logits[i][zero_indices]
+                            _, top_indices = torch.topk(original_scores, needed)
+                            selected_indices = zero_indices[top_indices]
+                            # Give small positive weights (create new tensor instead of in-place)
+                            values = torch.full((len(selected_indices),), 0.01, device=w.device)
+                            w = w.scatter(0, selected_indices, values)
+                        else:
+                            # If we don't have enough zero weights, use all available zero weights
+                            if len(zero_indices) > 0:
+                                values = torch.full((len(zero_indices),), 0.01, device=w.device)
+                                w = w.scatter(0, zero_indices, values)
                 
                 # If too many assets, keep only top ones
                 elif max_assets is not None and non_zero_count > max_assets:
-                    _, top_indices = torch.topk(w, max_assets)
+                    # Safety check: ensure max_assets is reasonable
+                    effective_max_assets = min(max_assets, n_assets)
+                    effective_max_assets = max(1, effective_max_assets)  # At least 1 asset
+                    
+                    _, top_indices = torch.topk(w, effective_max_assets)
                     new_w = torch.zeros_like(w)
                     new_w = new_w.scatter(0, top_indices, w[top_indices])
                     w = new_w
@@ -378,10 +469,11 @@ def build_transformer_model(
     d_mlp_hidden: int = 2048,
     dropout: float = 0.1,
     max_n: int = 1000,
-    causal: bool = True
+    causal: bool = True,
+    activation='relu6'
 ) -> GPT2LikeTransformer:
     """
-    Build a GPT-2-like transformer model with specified architecture.
+    Build a GPT-2-like transformer model with specified architecture and activation function.
     
     Args:
         past_window_size: Fixed dimension t for input matrices (n x t)
@@ -393,18 +485,45 @@ def build_transformer_model(
         dropout: Dropout probability
         max_n: Maximum expected value of n (for positional encoding)
         causal: Whether to use causal (GPT-2) attention masking
+        activation: Activation function name or PyTorch module. Options:
+                   CPU-Optimized:
+                   - 'relu6' (default): Fast, stable, bounded [0,6]
+                   - 'relu': Classic ReLU
+                   - 'leaky_relu': Prevents dead neurons
+                   
+                   GPU/Modern:
+                   - 'gelu': Transformer standard
+                   - 'swish'/'silu': Smooth, modern
+                   - 'mish': Very smooth, modern
+                   
+                   Mobile/Edge:
+                   - 'hard_swish': Mobile-optimized Swish
+                   - 'hard_mish': Computational proxy for Mish
+                   - 'hard_gelu': Fast GELU approximation
+                   
+                   Advanced:
+                   - 'prelu': Learnable parameters
+                   - 'elu', 'selu': Exponential variants
+                   - 'glu': Gated Linear Unit
     
     Returns:
         GPT2LikeTransformer model ready for training
     
     Example:
-        >>> model = build_transformer_model(past_window_size=10, n_transformer_blocks=4, causal=True)
-        >>> matrix_input = torch.randn(32, 50, 10)  # batch_size=32, n=50, t=10
-        >>> # Scalar input: prediction horizon
-        >>> scalar_input = torch.tensor([20]).repeat(32, 1)  # 20 days ahead
-        >>> # Constraint vector: [max_weight, min_assets, max_assets, sparsity]
-        >>> constraints = torch.tensor([0.5, 5/100, 20/100, 0.02*100]).repeat(32, 1)  # batch_size=32
-        >>> output = model(matrix_input, scalar_input, constraints)  # shape: (32, 50)
+        >>> # CPU-optimized (default)
+        >>> model = build_transformer_model(past_window_size=65)
+        >>> 
+        >>> # GPU with modern activation
+        >>> model = build_transformer_model(past_window_size=65, activation='mish')
+        >>> 
+        >>> # Mobile-optimized
+        >>> model = build_transformer_model(past_window_size=65, activation='hard_swish')
+        >>> 
+        >>> # Classic transformer
+        >>> model = build_transformer_model(past_window_size=65, activation='gelu')
+        >>> 
+        >>> # Still supports PyTorch modules directly
+        >>> model = build_transformer_model(past_window_size=65, activation=torch.nn.ReLU())
     """
     model = GPT2LikeTransformer(
         past_window_size=past_window_size,
@@ -415,10 +534,17 @@ def build_transformer_model(
         d_mlp_hidden=d_mlp_hidden,
         dropout=dropout,
         max_n=max_n,
-        causal=causal
+        causal=causal,
+        activation=activation
     )
     
-    print(f"Model created with {model.get_num_parameters():,} parameters")
+    # Get activation name for display
+    if isinstance(activation, str):
+        activation_name = activation.upper()
+    else:
+        activation_name = activation.__class__.__name__
+    
+    print(f"Model created with {model.get_num_parameters():,} parameters using {activation_name} activation")
     return model
 
 
@@ -452,40 +578,43 @@ def create_adam_optimizer(model, lr=1e-4, weight_decay=1e-5, betas=(0.9, 0.999),
 
 
 #------------ Model Saving and Loading Functions -----------
-def save_complete_model(model, filepath, model_config=None):
+def save_model(model, filepath, model_config):
     """
-    Save complete model (architecture + weights) and configuration.
+    Save model using state_dict and config (safe method that avoids PyTorch security issues).
     
     Args:
         model: The trained model to save
         filepath: Path where to save the model (should end with .pt)
-        model_config: Optional dictionary with model configuration parameters
+        model_config: Dictionary with model configuration parameters (REQUIRED)
     
     Example:
         >>> config = {
         ...     'past_window_size': 30,
         ...     'd_model': 256,
         ...     'n_heads': 8,
-        ...     'n_transformer_blocks': 6
+        ...     'n_transformer_blocks': 6,
+        ...     'max_n': 100
         ... }
-        >>> save_complete_model(model, 'my_model.pt', config)
+        >>> save_model(model, 'my_model.pt', config)
     """
     from datetime import datetime
     
+    if not model_config:
+        raise ValueError("model_config is required for saving. Include at least: past_window_size, d_model, n_heads, n_transformer_blocks, max_n")
+    
     save_data = {
-        'model': model,
         'model_state_dict': model.state_dict(),
-        'model_config': model_config or {},
+        'model_config': model_config,
         'save_timestamp': datetime.now().isoformat()
     }
     
     torch.save(save_data, filepath)
-    print(f"Complete model and configuration saved to: {filepath}")
+    print(f"Model saved to: {filepath}")
 
 
-def load_complete_model(filepath, device='cpu'):
+def load_model(filepath, device='cpu'):
     """
-    Load complete model (architecture + weights) and configuration.
+    Load model by reconstructing from config and loading weights.
     
     Args:
         filepath: Path to the saved model file
@@ -495,18 +624,26 @@ def load_complete_model(filepath, device='cpu'):
         tuple: (model, model_config) - loaded model and its configuration
     
     Example:
-        >>> model, config = load_complete_model('my_model.pt')
-        >>> print(f"Model has {config['past_window_size']} past window size")
+        >>> model, config = load_model('my_model.pt')
         >>> weights = predict_portfolio_weights(model, data, future_window_size=5)
     """
-    checkpoint = torch.load(filepath, map_location=device)
+    checkpoint = torch.load(filepath, map_location=device, weights_only=True)
     
-    model = checkpoint['model']
-    model_config = checkpoint.get('model_config', {})
+    model_config = checkpoint['model_config']
     
-    # Ensure model is on the correct device
+    # Reconstruct the model from config
+    model = build_transformer_model(
+        past_window_size=model_config['past_window_size'],
+        d_model=model_config.get('d_model', 256),
+        n_heads=model_config.get('n_heads', 8),
+        n_transformer_blocks=model_config.get('n_transformer_blocks', 6),
+        max_n=model_config.get('max_n', 100)
+    )
+    
+    # Load the weights
+    model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
-    model.eval()  # Set to evaluation mode
+    model.eval()
     
     print(f"Model loaded from: {filepath}")
     print(f"Save timestamp: {checkpoint.get('save_timestamp', 'Unknown')}")
@@ -535,7 +672,14 @@ def load_model_from_checkpoint(model_architecture, checkpoint_path, device='cpu'
         >>> model = load_model_from_checkpoint(model, 'model_checkpoint_200.pt')
         >>> weights = predict_portfolio_weights(model, data, future_window_size=5)
     """
-    state_dict = torch.load(checkpoint_path, map_location=device)
+    try:
+        # Try loading as weights_only=True first (safer for state_dict)
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception as e:
+        print(f"Warning: weights_only=True failed, trying weights_only=False: {e}")
+        # Fallback to weights_only=False
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
     model_architecture.load_state_dict(state_dict)
     model_architecture = model_architecture.to(device)
     model_architecture.eval()
@@ -1184,17 +1328,35 @@ def predict_portfolio_weights(model, data_input, future_window_size=20,
         
         batch_size, n_assets, _ = matrix_input.shape
         
+        # CRITICAL: Validate and adjust constraints for prediction
+        # Ensure all constraints are logically consistent with available assets
+        
+        # 1. Ensure max_assets doesn't exceed available assets
+        effective_max_assets = min(max_assets, n_assets)
+        
+        # 2. Ensure min_assets doesn't exceed max_assets or available assets
+        effective_min_assets = min(min_assets, effective_max_assets, n_assets)
+        
+        # 3. Ensure min_assets is at least 1 if specified
+        if min_assets > 0:
+            effective_min_assets = max(1, effective_min_assets)
+        
+        # 4. Validation warnings for user
+        if min_assets > n_assets:
+            print(f"Warning: min_assets ({min_assets}) > available assets ({n_assets}). Using {effective_min_assets}")
+        if max_assets > n_assets:
+            print(f"Warning: max_assets ({max_assets}) > available assets ({n_assets}). Using {effective_max_assets}")
+        if min_assets > max_assets:
+            print(f"Warning: min_assets ({min_assets}) > max_assets ({max_assets}). Adjusted to min={effective_min_assets}, max={effective_max_assets}")
+
         # Scalar input: future window size (prediction horizon)
         scalar_input = torch.tensor(future_window_size, dtype=torch.float32, device=matrix_input.device)
         scalar_input = scalar_input.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1)  # (batch_size, 1)
         
-        # Constraint input: portfolio constraints
-        # Ensure max_assets doesn't exceed actual number of assets
-        effective_max_assets = min(max_assets, n_assets)
-        
+        # Constraint input: portfolio constraints (using validated values)
         constraint_vector = torch.tensor([
             max_weight,  # Max weight (0-1, where 1.0 = unconstrained)
-            min_assets / 100.0,  # Normalize min assets (0 = unconstrained)
+            effective_min_assets / 100.0,  # Normalize min assets (0 = unconstrained)
             effective_max_assets / 100.0,  # Normalize max assets
             sparsity_threshold * 100.0  # Scale sparsity threshold (0.01 -> 1.0)
         ], dtype=torch.float32, device=matrix_input.device)
@@ -1382,6 +1544,9 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
     
     # Backward pass
     total_loss.backward()
+    
+    # Gradient clipping for stability (very important for transformer training)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     
     # Update parameters
     optimizer.step()

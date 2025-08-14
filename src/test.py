@@ -1,26 +1,28 @@
-#%%
+#%% - Imports
+# Imports
 """
 Test script for the Tesseract portfolio optimization transformer model.
 
 KEY UPDATES:
-1. GMSE (Geometric Mean Square Error) is now the default loss aggregation method
-2. Proper train/test split: 80% training, 20% testing to prevent data leakage
-3. Training uses only training data (first 80% of timeseries)
-4. Testing/inference uses only test data (last 20% of timeseries) 
+1. Progressive Loss Aggregation: MAE → GMAE → GMSE for maximum stability
+2. Proper train/test split: 90% training, 10% testing to prevent data leakage
+3. Training uses only training data (first 90% of timeseries)
+4. Testing/inference uses only test data (last 10% of timeseries) 
 5. Prediction uses the last past_window_size rows from test data as "current state"
-6. Training logs saved to repo_root/logs/ by default
-7. Model checkpoints saved to repo_root/checkpoints/ by default
+6. Comprehensive constraint validation prevents impossible portfolio requirements
+7. Enhanced logging captures loss aggregation method, phase, and curriculum progress
 
 PREDICTION PROCESS:
 - Input: Historical price data (DataFrame/array)
-- The model takes the LAST past_window_size rows (e.g., last 30 days)
+- The model takes the LAST past_window_size rows (e.g., last 65 days)
 - These represent the "current market state"
 - Output: Portfolio weights optimized for the NEXT future_window_size periods
 
 LOGGING & CHECKPOINTS:
-- Training logs: CSV files with iteration and loss data
+- Training logs: Comprehensive CSV files with iteration, loss, loss_aggregation method, phase, batch_size, n_cols, progress
 - Model checkpoints: Saved every 50 iterations as .pt files
 - Default paths: repo_root/logs/ and repo_root/checkpoints/
+- Loss transitions (MAE→GMAE→GMSE) are clearly marked for analysis
 - Custom paths can be specified via log_path and checkpoint_path arguments
 """
 import sys
@@ -52,16 +54,16 @@ df = pd.read_parquet("C:/Users/malha/Documents/Data/S&P500 components/stocks_wid
 timeseries = df.drop(columns=['report_date']).values
 
 # Define parameters
-past_window_size = 30
-future_window_size = 5
+past_window_size = 65
+future_window_size = 21
 
 # IMPORTANT: Split data into train/test sets
-# Use first 80% for training, last 20% for testing
-split_ratio = 0.8
+# Use first 90% for training, last 10% for testing
+split_ratio = 0.9
 split_index = int(len(timeseries) * split_ratio)
 
-train_data = timeseries[:split_index]  # First 80% for training
-test_data = timeseries[split_index:]   # Last 20% for testing
+train_data = timeseries[:split_index]  # First 90% for training
+test_data = timeseries[split_index:]   # Last 10% for testing
 
 print(f"Total data shape: {timeseries.shape}")
 print(f"Training data shape: {train_data.shape}")
@@ -69,7 +71,7 @@ print(f"Test data shape: {test_data.shape}")
 print(f"Training period: rows 0 to {split_index-1}")
 print(f"Test period: rows {split_index} to {len(timeseries)-1}")
 
-#1. Build Model
+#1. Build Model with CPU-optimized activation function
 n_assets = timeseries.shape[1]
 model = build_transformer_model(
     past_window_size=past_window_size,
@@ -77,22 +79,21 @@ model = build_transformer_model(
     n_heads=8,
     n_transformer_blocks=6,
     d_ff=1024,
-    max_n=n_assets
+    max_n=n_assets,
+    activation='hard_mish'  # Hard Mish - computational proxy for Mish activation
 )
 
-#2. Build Optimizer
-optimizer = create_adam_optimizer(model)
+#2. Build Optimizer with reduced learning rate for more stable training
+optimizer = create_adam_optimizer(model, lr=5e-5, weight_decay=5e-5)  # Increased weight decay for better regularization
 
 #3. Portfolio constraints - These are now ranges for random sampling during training!
 # The training loop will randomly sample within these ranges for each iteration
+# IMPORTANT: These ranges must be logically consistent across the curriculum
 max_weight_range = (0.05, 0.5)  # Max individual asset weight: 5%-50%
-min_assets_range = (5, 30)       # Minimum number of assets in portfolio: 5-30
-max_assets_range = (20, 100)     # Maximum number of assets in portfolio: 20-100  
+min_assets_range = (3, 15)       # Minimum number of assets in portfolio: 3-15 (safe for min_n_cols=5)
+max_assets_range = (15, 100)     # Maximum number of assets in portfolio: 15-100 (ensures min <= max)
 sparsity_threshold_range = (0.001, 0.05)  # Sparsity threshold: 0.1%-5%
 
-#4. Test data pipeline for training with random constraint sampling
-past_window_size = 30
-future_window_size = 5
 # %% - Test Training (using only training data)
 # Train the model with random constraint sampling using ONLY the training data
 print("Starting training with random constraint sampling on training data only...")
@@ -102,13 +103,13 @@ trained_model = train_model(
     data=train_data,  # Use ONLY training data (first 80%)
     past_window_size=past_window_size,
     future_window_size=future_window_size,
-    min_n_cols=10,
-    max_n_cols=50,
-    min_batch_size=16,
-    max_batch_size=64,
-    iterations=200,
+    min_n_cols=5,
+    max_n_cols=200,
+    min_batch_size=16,      # Reduced for CPU training - smaller batches work better
+    max_batch_size=256,     # CPU can handle larger batches with 32GB RAM - increased from 128
+    iterations=10000,       # Increased iterations to compensate for smaller batches
     metric="expected_return", #'sharpe_ratio',
-    loss_aggregation='gmse',  # Using GMSE (Geometric Mean Square Error) as default
+    loss_aggregation='progressive',  # Progressive curriculum: mae → gmae → gmse for maximum stability
     # Constraint ranges for random sampling
     max_weight_range=max_weight_range,
     min_assets_range=min_assets_range,
@@ -164,7 +165,7 @@ portfolio_weights = predict_portfolio_weights(
     model=trained_model,
     data_input=test_df,  # Test data DataFrame - uses LAST past_window_size rows automatically
     future_window_size=future_window_size,
-    max_assets_subset=50,  # Use only first 50 assets for simplicity
+    max_assets_subset=100,  # Use only first 100 assets for simplicity
     **conservative_constraints
 )
 
@@ -202,10 +203,11 @@ print("SUMMARY:")
 print(f"✓ Model trained on data from timesteps 0 to {split_index-1}")
 print(f"✓ Predictions made using timesteps {split_index + len(test_data) - past_window_size} to {split_index + len(test_data) - 1}")
 print(f"✓ This ensures true out-of-sample testing with no data leakage")
-print(f"✓ Using GMSE (Geometric Mean Square Error) loss aggregation")
+print(f"✓ Using Progressive loss aggregation (MAE → GMAE → GMSE)")
 print(f"✓ Training logs saved to repo_root/logs/")
 print(f"✓ Model checkpoints saved to repo_root/checkpoints/")
 print("✓ Model successfully handles different constraint combinations on unseen data!")
+print("✓ Comprehensive constraint validation prevents impossible portfolio requirements!")
 print("="*60)
 
 # %% Model Saving and Loading Examples
@@ -216,14 +218,15 @@ print("="*60)
 # The saving/loading functions are already imported via the wildcard import above
 
 # 1. Save the complete trained model with configuration
-print("\n1. Saving complete trained model...")
+print("\n1. Saving trained model...")
 model_config = {
     'past_window_size': past_window_size,
     'future_window_size': future_window_size,
     'd_model': 256,
     'n_heads': 8,
     'n_transformer_blocks': 6,
-    'loss_aggregation': 'gmse',
+    'max_n': n_assets,  # Number of assets in the dataset
+    'loss_aggregation': 'progressive',
     'training_iterations': 200,
     'metric_used': 'expected_return'
 }
@@ -234,16 +237,18 @@ repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 complete_model_path = os.path.join(repo_root, 'models', 'trained_portfolio_model.pt')
 os.makedirs(os.path.dirname(complete_model_path), exist_ok=True)
 
-save_complete_model(trained_model, complete_model_path, model_config)
+# Save the model (using the safe method)
+save_model(trained_model, complete_model_path, model_config)
 
 # 2. Save just the model configuration separately
 config_path = os.path.join(repo_root, 'models', 'model_config.json')
 save_model_config(trained_model, config_path)
 
-print("\n2. Testing model loading from complete save...")
+print("\n2. Testing model loading...")
 
-# 3. Load the complete model (useful for inference in production)
-loaded_model, loaded_config = load_complete_model(complete_model_path)
+# 3. Load the model
+loaded_model, loaded_config = load_model(complete_model_path)
+print(f"✓ Model loaded with configuration: {loaded_config}")
 
 print(f"✓ Model loaded with configuration: {loaded_config}")
 

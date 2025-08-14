@@ -135,12 +135,18 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
 
 def train_model(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
-                       metric ='sharpe_ratio', loss_aggregation='gmse',
+                       metric ='sharpe_ratio', loss_aggregation='progressive',
                        # Constraint ranges for random sampling
                        max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
                        max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
                        # Logging and checkpoint paths
-                       log_path=None, checkpoint_path=None):
+                       log_path=None, checkpoint_path=None,
+                       # Frequency controls
+                       checkpoint_frequency=50, log_frequency=10,
+                       # Stability controls
+                       use_scheduler=True, scheduler_patience=500,
+        # Early stopping  
+        early_stopping_patience=2000, early_stopping_threshold=1e-6):
     """
     Progressive batch creation with curriculum learning and random constraint sampling.
     Starts with small batch_size and n_cols, gradually increases both.
@@ -157,22 +163,25 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         iterations: Total number of iterations
         metric: Metric to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
         loss_aggregation: Method to aggregate losses across batch
-            - 'mae': Mean Absolute Error - arithmetic mean
+            - 'mae': Mean Absolute Error - arithmetic mean (most stable)
             - 'mse': Mean Square Error - mean of squared losses  
-            - 'gmae': Geometric Mean Absolute Error - log-space geometric mean
-            - 'gmse': Geometric Mean Square Error (default, user's proposed method)
+            - 'gmae': Geometric Mean Absolute Error - log-space geometric mean (balanced)
+            - 'gmse': Geometric Mean Square Error (most sensitive to outliers)
+            - 'progressive': Progressive curriculum: mae → gmae → gmse (recommended for stability)
         max_weight_range: (min, max) range for max_weight constraint sampling
         min_assets_range: (min, max) range for min_assets constraint sampling  
         max_assets_range: (min, max) range for max_assets constraint sampling
         sparsity_threshold_range: (min, max) range for sparsity_threshold sampling
         log_path: Path to save training logs (default: repo_root/logs/)
         checkpoint_path: Path to save model checkpoints (default: repo_root/checkpoints/)
+        checkpoint_frequency: How often to save model checkpoints (default: every 50 iterations)
+        log_frequency: How often to save loss data and print progress (default: every 10 iterations)
         
     Returns:
         Trained model
         
     Example:
-        >>> # Train with custom paths
+        >>> # Train with progressive loss aggregation for maximum stability
         >>> trained_model = train_model(
         ...     model=model, 
         ...     optimizer=optimizer, 
@@ -180,20 +189,9 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         ...     past_window_size=20, 
         ...     future_window_size=10,
         ...     metric='sharpe_ratio',
-        ...     loss_aggregation='gmse',
-        ...     log_path='/path/to/custom/logs',
-        ...     checkpoint_path='/path/to/custom/checkpoints'
-        ... )
-        >>> 
-        >>> # Train with default paths (repo_root/logs/ and repo_root/checkpoints/)
-        >>> trained_model = train_model(
-        ...     model=model, 
-        ...     optimizer=optimizer, 
-        ...     data=df, 
-        ...     past_window_size=20, 
-        ...     future_window_size=10,
-        ...     metric='geometric_sharpe_ratio',
-        ...     loss_aggregation='mae'
+        ...     loss_aggregation='progressive',  # Start gentle, get stricter over time
+        ...     checkpoint_frequency=100,  # Save every 100 iterations
+        ...     log_frequency=20  # Log every 20 iterations
         ... )
     """
     # start time
@@ -218,10 +216,29 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
     os.makedirs(checkpoint_path, exist_ok=True)
     
     print(f"Logs will be saved to: {log_path}")
-    print(f"Model checkpoints will be saved to: {checkpoint_path}")
+    print(f"Checkpoints will be saved to: {checkpoint_path}")
+    print(f"Checkpoint frequency: every {checkpoint_frequency} iterations")
+    print(f"Log frequency: every {log_frequency} iterations")
 
-    # Create log
-    log = pd.DataFrame(columns=['iteration', 'loss'])
+    # Early stopping setup
+    best_loss = float('inf')
+    patience_counter = 0
+
+    # Create log with comprehensive training information
+    log = pd.DataFrame(columns=[
+        'iteration', 'loss', 'metric_loss', 'reg_loss', 
+        'loss_aggregation', 'phase', 'batch_size', 'n_cols', 'progress'
+    ])
+
+    # Set up learning rate scheduler for stability
+    if use_scheduler:
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, 
+                                    patience=scheduler_patience, verbose=True, 
+                                    min_lr=1e-7)
+        print(f"Learning rate scheduler enabled with patience={scheduler_patience}")
+    else:
+        scheduler = None
 
     # Convert DataFrame to numpy array if needed
     if hasattr(data, 'values'):  # Check if it's a DataFrame
@@ -232,22 +249,76 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
     
     valid_indices = len(data_array) - (past_window_size + future_window_size)
     
+    print(f"Starting training for {iterations} iterations...")
+    
     # Loop through fixed number of iterations with progressive difficulty
     for i in range(iterations):
         # Calculate progressive values (linear interpolation)
         progress = i / (iterations - 1) if iterations > 1 else 0  # 0 to 1
         
+        # Progressive loss aggregation curriculum for stability
+        prev_aggregation = None
+        if i > 0:  # Track previous aggregation method for transition detection
+            prev_progress = (i - 1) / (iterations - 1) if iterations > 1 else 0
+            if loss_aggregation == 'progressive':
+                if prev_progress <= 0.4:
+                    prev_aggregation = 'mae'
+                elif prev_progress <= 0.7:
+                    prev_aggregation = 'gmae'
+                else:
+                    prev_aggregation = 'gmse'
+        
+        if loss_aggregation == 'progressive':
+            # Phase 1 (0-40%): MAE (most stable, forgiving to outliers)
+            # Phase 2 (40-70%): GMAE (balanced, emphasizes consistency)  
+            # Phase 3 (70-100%): GMSE (most sensitive, best final performance)
+            if progress <= 0.4:
+                current_loss_aggregation = 'mae'
+                phase = "Stability (MAE)"
+            elif progress <= 0.7:
+                current_loss_aggregation = 'gmae'
+                phase = "Balanced (GMAE)"
+            else:
+                current_loss_aggregation = 'gmse'
+                phase = "Performance (GMSE)"
+            
+            # Detect and announce phase transitions
+            if prev_aggregation and prev_aggregation != current_loss_aggregation:
+                print(f"\n🔄 PHASE TRANSITION at iteration {i + 1}: {prev_aggregation.upper()} → {current_loss_aggregation.upper()}")
+                print(f"   Expect step change in loss due to different aggregation method")
+                print(f"   Progress: {progress*100:.1f}% | Phase: {phase}\n")
+        else:
+            # Use fixed aggregation method
+            current_loss_aggregation = loss_aggregation
+            phase = f"Fixed ({loss_aggregation.upper()})"
+
         # Progressive n_cols: start small, end large
         current_n_cols = int(min_n_cols + progress * (max_n_cols - min_n_cols))
         
-        # Progressive batch_size: start small, end large
+        # Progressive batch_size: start small, end large  
         current_batch_size = int(min_batch_size + progress * (max_batch_size - min_batch_size))
         
-        # Randomly sample constraints for this iteration to ensure full coverage
-        max_weight = np.random.uniform(max_weight_range[0], max_weight_range[1])
-        min_assets = np.random.randint(min_assets_range[0], min_assets_range[1] + 1)
-        max_assets = np.random.randint(max_assets_range[0], max_assets_range[1] + 1)
-        sparsity_threshold = np.random.uniform(sparsity_threshold_range[0], sparsity_threshold_range[1])
+        # More structured constraint progression (smoother than fully random)
+        # Use a mix of curriculum learning (progressive) and random sampling
+        curriculum_weight = 0.7  # 70% curriculum, 30% random
+        
+        # Progressive constraint difficulty
+        prog_max_weight = max_weight_range[1] - progress * (max_weight_range[1] - max_weight_range[0])  # Start loose, get stricter
+        prog_min_assets = min_assets_range[0] + progress * (min_assets_range[1] - min_assets_range[0])  # Start few, require more
+        prog_max_assets = max_assets_range[1] - progress * (max_assets_range[1] - max_assets_range[0])  # Start many, limit more
+        prog_sparsity = sparsity_threshold_range[0] + progress * (sparsity_threshold_range[1] - sparsity_threshold_range[0])  # Start low, increase
+        
+        # Random sampling within ranges
+        rand_max_weight = np.random.uniform(max_weight_range[0], max_weight_range[1])
+        rand_min_assets = np.random.randint(min_assets_range[0], min_assets_range[1] + 1)
+        rand_max_assets = np.random.randint(max_assets_range[0], max_assets_range[1] + 1)
+        rand_sparsity = np.random.uniform(sparsity_threshold_range[0], sparsity_threshold_range[1])
+        
+        # Combine curriculum and random constraints
+        max_weight = curriculum_weight * prog_max_weight + (1 - curriculum_weight) * rand_max_weight
+        min_assets = int(curriculum_weight * prog_min_assets + (1 - curriculum_weight) * rand_min_assets)
+        max_assets = int(curriculum_weight * prog_max_assets + (1 - curriculum_weight) * rand_max_assets)
+        sparsity_threshold = curriculum_weight * prog_sparsity + (1 - curriculum_weight) * rand_sparsity
         
         # Use the create_batch function to get each batch
         past_batch_tensor, future_batch_tensor = create_batch(data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
@@ -264,12 +335,29 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         scalar_input = torch.tensor(future_window_size, dtype=torch.float32).unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 1)
         
         # Constraint vector for portfolio constraints
-        # Ensure max_assets doesn't exceed current number of columns
+        # CRITICAL: Ensure constraints are logically consistent with current batch
+        
+        # 1. Ensure max_assets doesn't exceed current number of assets
         effective_max_assets = min(max_assets, current_n_cols)
         
+        # 2. Ensure min_assets doesn't exceed max_assets or current assets
+        effective_min_assets = min(min_assets, effective_max_assets, current_n_cols)
+        
+        # 3. Ensure min_assets is reasonable (at least 1)
+        effective_min_assets = max(1, effective_min_assets)
+        
+        # 4. Additional safety check: if constraints are impossible, use safe defaults
+        if effective_min_assets > current_n_cols:
+            print(f"Warning: min_assets ({effective_min_assets}) > available assets ({current_n_cols}). Using {current_n_cols//2}")
+            effective_min_assets = max(1, current_n_cols // 2)
+            
+        if effective_max_assets < effective_min_assets:
+            print(f"Warning: max_assets ({effective_max_assets}) < min_assets ({effective_min_assets}). Adjusting...")
+            effective_max_assets = max(effective_min_assets, current_n_cols // 2)
+
         constraint_vector = torch.tensor([
             max_weight,  # Max weight (0.0-1.0, where 1.0 = unconstrained)
-            min_assets / 100.0,  # Normalize min assets (0-100, where 0 = unconstrained)
+            effective_min_assets / 100.0,  # Normalize min assets (0-100, where 0 = unconstrained)
             effective_max_assets / 100.0,  # Normalize max assets (0-100)
             sparsity_threshold * 100.0  # Scale sparsity threshold (0.01 -> 1.0)
         ], dtype=torch.float32)
@@ -291,46 +379,73 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
             'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
         }
         
-        # Temp output example
-        # print(f"Iteration {i+1}/{iterations}: n_cols={current_n_cols}, batch_size={current_batch_size}, shapes=({past_batch_tensor.shape}, {future_batch_tensor.shape})")
+        # Update model with current loss aggregation method
         loss_dict = update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
                      max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold,
-                     loss_aggregation=loss_aggregation)
+                     loss_aggregation=current_loss_aggregation)
 
-        # every 50 iterations, save weights and log losses
-        if (i + 1) % 50 == 0:
-            print(f"Saving model at iteration {i + 1}")
+        # Update learning rate scheduler if enabled
+        if scheduler is not None:
+            scheduler.step(loss_dict['loss'])
+
+        # Early stopping check
+        current_loss = loss_dict['loss']
+        if current_loss < best_loss - early_stopping_threshold:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= early_stopping_patience:
+            print(f"\nEarly stopping triggered at iteration {i + 1}")
+            print(f"Best loss: {best_loss:.6f}, Current loss: {current_loss:.6f}")
+            break
+
+        # ALWAYS log to dataframe (complete record for analysis)
+        new_row = pd.DataFrame({
+            'iteration': [i + 1], 
+            'loss': [loss_dict['loss']],
+            'metric_loss': [loss_dict['metric_loss']],
+            'reg_loss': [loss_dict['reg_loss']],
+            'loss_aggregation': [current_loss_aggregation],
+            'phase': [phase],
+            'batch_size': [current_batch_size],
+            'n_cols': [current_n_cols],
+            'progress': [progress]
+        })
+        log = pd.concat([log, new_row], ignore_index=True)
+
+        # Console output at specified frequency only
+        if (i + 1) % log_frequency == 0:
+            print(f"Iteration {i + 1}/{iterations} | Phase: {phase} | Loss: {loss_dict['loss']:.6f} | Metric: {loss_dict['metric_loss']:.6f} | Agg: {current_loss_aggregation.upper()} | Progress: {progress*100:.1f}%")
+
+        # Save model checkpoint at specified frequency
+        if (i + 1) % checkpoint_frequency == 0:
             checkpoint_filename = f'model_checkpoint_{i + 1}.pt'
             checkpoint_filepath = os.path.join(checkpoint_path, checkpoint_filename)
             torch.save(model.state_dict(), checkpoint_filepath)
-            print(f"Model checkpoint saved to: {checkpoint_filepath}")
-            
-            # Log the loss for this checkpoint
-            new_row = pd.DataFrame({'iteration': [i + 1], 'loss': [loss_dict['loss']]})
-            log = pd.concat([log, new_row], ignore_index=True)
 
     # Save final complete model (architecture + weights)
     final_model_filename = 'final_trained_model.pt'
     final_model_filepath = os.path.join(checkpoint_path, final_model_filename)
     torch.save(model, final_model_filepath)
-    print(f"Complete final model saved to: {final_model_filepath}")
     
     # Also save final state dict for compatibility
     final_state_dict_filename = 'final_model_state_dict.pt'
     final_state_dict_filepath = os.path.join(checkpoint_path, final_state_dict_filename)
     torch.save(model.state_dict(), final_state_dict_filepath)
-    print(f"Final model state dict saved to: {final_state_dict_filepath}")
 
     # Save final log to CSV with datetime filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f'training_log_{timestamp}.csv'
     log_filepath = os.path.join(log_path, log_filename)
     log.to_csv(log_filepath, index=False)
-    print(f"Training log saved to: {log_filepath}")
 
     end_time = datetime.now()
-    print("Training completed at", end_time)
-    print(f"Total training time: {end_time - start_time}")
+    print(f"\nTraining completed! Total time: {end_time - start_time}")
+    print(f"Final loss: {loss_dict['loss']:.6f} | Final aggregation: {current_loss_aggregation.upper()}")
+    print(f"Final model saved to: {final_model_filepath}")
+    print(f"Training log saved to: {log_filepath}")
     return model
 
 #%%

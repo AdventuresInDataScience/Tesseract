@@ -205,3 +205,83 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Machine Learning & Data Science specific
+# Model files and checkpoints
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.pb
+*.onnx
+*.tflite
+
+# Training logs and outputs
+logs/
+checkpoints/
+models/
+outputs/
+results/
+experiments/
+runs/
+tensorboard/
+wandb/
+
+# Data files (add specific data directories as needed)
+data/
+datasets/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.json
+*.jsonl
+*.npy
+*.npz
+
+# Jupyter notebook outputs
+*.ipynb
+
+# Configuration files with sensitive data
+config.yaml
+config.json
+.env.local
+.env.production
+secrets.json
+
+# GPU/CUDA cache
+.torch/
+.tensorrt/
+
+# IDE and editor files
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+.idea/workspace.xml
+.idea/usage.statistics.xml
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Backup files
+*.bak
+*.backup
