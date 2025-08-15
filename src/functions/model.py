@@ -1451,32 +1451,62 @@ def geometric_mean_square_error_aggregation(losses):
     return original_sign * result
 
 
+def huber_loss_aggregation(losses, delta=1.0):
+    """
+    Aggregate losses using Huber loss for robustness to outliers.
+    Huber loss is quadratic for small errors and linear for large errors.
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses
+        delta: Threshold for switching from quadratic to linear (default: 1.0)
+    
+    Returns:
+        Huber loss aggregation of the losses
+    """
+    abs_losses = torch.abs(losses)
+    
+    # Huber loss: 0.5 * x^2 for |x| <= delta, delta * (|x| - 0.5 * delta) otherwise
+    huber_losses = torch.where(
+        abs_losses <= delta,
+        0.5 * losses ** 2,
+        delta * (abs_losses - 0.5 * delta)
+    )
+    
+    # Return mean of Huber losses with sign preservation
+    return torch.sign(losses.mean()) * huber_losses.mean()
+
+
 def update_model(model, optimizer, past_batch, future_batch, metric, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
-                regularization_lambda=0.0, loss_aggregation='arithmetic', *args, **kwargs):
+                regularization_lambda=0.0, loss_aggregation='arithmetic', 
+                gradient_accumulation_steps=1, accumulation_step=0, *args, **kwargs):
     """
-    Perform forward and backward pass to update the model.
+    Perform forward and backward pass to update the model with gradient accumulation support.
     
     Args:
         model: The GPT2LikeTransformer model to update
         optimizer: PyTorch optimizer (e.g., Adam, SGD)
         past_batch: Dictionary containing past data for model input:
             - 'matrix_input': Tensor of shape (batch_size, n, past_window_size)
-            - 'scalar_input': Tensor of shape (batch_size, 1) containing future_window_size
-            - 'constraint_input': Tensor of shape (batch_size, 4) containing constraints
+            - 'scalar_input': Tensor of shape (batch_size, 1) containing normalized future_window_size
+            - 'constraint_input': Tensor of shape (batch_size, 4) containing normalized constraints
+            - 'raw_constraints': Dictionary with raw constraint values for enforcement
         future_batch: Dictionary containing future data for loss calculation:
             - 'returns': Future returns matrix for portfolio evaluation
         metric: String name of the metric to optimize (e.g., 'sharpe_ratio')
-        max_weight: Maximum weight constraint (1.0 = unconstrained, used for regularization loss)
-        min_assets: Minimum number of assets constraint (0 = unconstrained, used for regularization loss)
-        max_assets: Maximum number of assets constraint (1000 = unconstrained, used for regularization loss)
-        sparsity_threshold: Threshold for setting small weights to zero (used for regularization loss)
+        max_weight: Maximum weight constraint (used with raw constraint values)
+        min_assets: Minimum number of assets constraint (used with raw constraint values)
+        max_assets: Maximum number of assets constraint (used with raw constraint values)
+        sparsity_threshold: Threshold for setting small weights to zero (used with raw constraint values)
         regularization_lambda: Weight for portfolio regularization loss
         loss_aggregation: Method to aggregate losses across batch:
-            - 'mae' or 'arithmetic': Mean Absolute Error - arithmetic mean (default)
+            - 'mae' or 'arithmetic': Mean Absolute Error - arithmetic mean
             - 'mse': Mean Square Error - mean of squared losses
+            - 'huber': Huber Loss - robust to outliers (good for Phase 1 stability)
             - 'gmae' or 'geometric': Geometric Mean Absolute Error - log-space geometric mean
-            - 'gmse' or 'geometric_mse': Geometric Mean Square Error (user's proposed method)
+            - 'gmse' or 'geometric_mse': Geometric Mean Square Error
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        accumulation_step: Current step in the accumulation cycle
         *args, **kwargs: Additional arguments passed to metric calculation
     
     Returns:
@@ -1486,15 +1516,15 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
             - 'reg_loss': The regularization loss (if applied)
             - 'weights': The predicted portfolio weights
     """
-    # Zero gradients
-    optimizer.zero_grad()
+    # Zero gradients only at the start of accumulation cycle (handled by calling function)
+    # The calling function (train_model) handles optimizer.zero_grad() timing
     
     # Extract inputs from past_batch
     matrix_input = past_batch['matrix_input']
-    scalar_input = past_batch['scalar_input']
+    scalar_input = past_batch['scalar_input'] 
     constraint_input = past_batch['constraint_input']
     
-    # Forward pass through model (future window and constraints are now separate inputs)
+    # Forward pass through model (with normalized inputs for neural network)
     weights = model(matrix_input, scalar_input, constraint_input)
     
     # Extract future returns for portfolio evaluation
@@ -1522,6 +1552,9 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
     elif loss_aggregation == 'mse':
         # Mean Square Error: Mean of squared losses
         metric_loss = mean_square_error_aggregation(stacked_losses)
+    elif loss_aggregation == 'huber':
+        # Huber Loss: Robust to outliers, good for Phase 1 stability
+        metric_loss = huber_loss_aggregation(stacked_losses)
     elif loss_aggregation == 'gmae' or loss_aggregation == 'geometric':
         # Geometric Mean Absolute Error: Using log-space operations (numerically stable)
         metric_loss = geometric_mean_absolute_error_aggregation(stacked_losses)
@@ -1542,16 +1575,21 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
     # Total loss (currently just metric loss)
     total_loss = metric_loss  # + regularization_lambda * reg_loss
     
-    # Backward pass
-    total_loss.backward()
+    # Scale loss by accumulation steps for gradient accumulation
+    scaled_loss = total_loss / gradient_accumulation_steps
     
-    # Gradient clipping for stability (very important for transformer training)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # Backward pass (accumulate gradients)
+    scaled_loss.backward()
     
-    # Update parameters
-    optimizer.step()
+    # Apply optimizer step only on the last accumulation step
+    if (accumulation_step + 1) % gradient_accumulation_steps == 0:
+        # Gradient clipping for stability (very important for transformer training)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # Update parameters
+        optimizer.step()
     
-    # Return loss information and weights
+    # Return loss information and weights (using unscaled loss for logging)
     return {
         'loss': total_loss.item(),
         'metric_loss': metric_loss.item(),

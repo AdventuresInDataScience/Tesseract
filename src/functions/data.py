@@ -136,6 +136,8 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
 def train_model(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
                        metric ='sharpe_ratio', loss_aggregation='progressive',
+                       # Additional metrics to log
+                       other_metrics_to_log=None,
                        # Constraint ranges for random sampling
                        max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
                        max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
@@ -145,12 +147,16 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
                        checkpoint_frequency=50, log_frequency=10,
                        # Stability controls
                        use_scheduler=True, scheduler_patience=500,
-        # Early stopping  
-        early_stopping_patience=2000, early_stopping_threshold=1e-6):
+                       # Early stopping  
+                       early_stopping_patience=2000, early_stopping_threshold=1e-6,
+                       # Enhanced optimizer configuration
+                       learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
+                       # Gradient accumulation for larger effective batch size
+                       gradient_accumulation_steps=4):
     """
-    Progressive batch creation with curriculum learning and random constraint sampling.
+    Progressive batch creation with curriculum learning, random constraint sampling, and enhanced stability features.
     Starts with small batch_size and n_cols, gradually increases both.
-    Randomly samples different constraints for each iteration to ensure full coverage.
+    Includes input normalization, Huber loss for Phase 1, enhanced optimizer configuration, and gradient accumulation.
     
     Args:
         data: pandas DataFrame or numpy array of shape (n_timesteps, n_assets)
@@ -163,11 +169,16 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         iterations: Total number of iterations
         metric: Metric to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
         loss_aggregation: Method to aggregate losses across batch
-            - 'mae': Mean Absolute Error - arithmetic mean (most stable)
+            - 'huber': Huber Loss - robust to outliers (Phase 1 stability)
             - 'mse': Mean Square Error - mean of squared losses  
             - 'gmae': Geometric Mean Absolute Error - log-space geometric mean (balanced)
             - 'gmse': Geometric Mean Square Error (most sensitive to outliers)
-            - 'progressive': Progressive curriculum: mae → gmae → gmse (recommended for stability)
+            - 'progressive': Progressive curriculum: huber → gmae → gmse (recommended for stability)
+        other_metrics_to_log: Additional metrics to calculate and log alongside the primary metric.
+            Can be a string (single metric) or list of strings (multiple metrics).
+            Available metrics: 'sharpe_ratio', 'geometric_sharpe_ratio', 'max_drawdown', 
+            'sortino_ratio', 'geometric_sortino_ratio', 'expected_return', 'carmdd', 
+            'omega_ratio', 'jensen_alpha', 'treynor_ratio', 'ulcer_index', 'k_ratio'
         max_weight_range: (min, max) range for max_weight constraint sampling
         min_assets_range: (min, max) range for min_assets constraint sampling  
         max_assets_range: (min, max) range for max_assets constraint sampling
@@ -176,12 +187,16 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         checkpoint_path: Path to save model checkpoints (default: repo_root/checkpoints/)
         checkpoint_frequency: How often to save model checkpoints (default: every 50 iterations)
         log_frequency: How often to save loss data and print progress (default: every 10 iterations)
+        learning_rate: Initial learning rate for enhanced optimizer (default: 1e-3)
+        weight_decay: L2 regularization for enhanced optimizer (default: 2e-4)
+        warmup_steps: Learning rate warmup steps (default: 500)
+        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size (default: 4)
         
     Returns:
         Trained model
         
     Example:
-        >>> # Train with progressive loss aggregation for maximum stability
+        >>> # Train with progressive loss aggregation and enhanced stability
         >>> trained_model = train_model(
         ...     model=model, 
         ...     optimizer=optimizer, 
@@ -189,7 +204,11 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         ...     past_window_size=20, 
         ...     future_window_size=10,
         ...     metric='sharpe_ratio',
-        ...     loss_aggregation='progressive',  # Start gentle, get stricter over time
+        ...     other_metrics_to_log=['max_drawdown', 'sortino_ratio'],  # Log additional metrics
+        ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
+        ...     learning_rate=1e-3,  # Enhanced optimizer settings
+        ...     weight_decay=2e-4,
+        ...     gradient_accumulation_steps=4,  # 4x larger effective batch size
         ...     checkpoint_frequency=100,  # Save every 100 iterations
         ...     log_frequency=20  # Log every 20 iterations
         ... )
@@ -197,6 +216,30 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
     # start time
     start_time = datetime.now()
     print("Training started at", start_time)
+
+    # Process other_metrics_to_log parameter
+    if other_metrics_to_log is None:
+        other_metrics_list = []
+    elif isinstance(other_metrics_to_log, str):
+        other_metrics_list = [other_metrics_to_log]
+    elif isinstance(other_metrics_to_log, list):
+        other_metrics_list = other_metrics_to_log
+    else:
+        raise ValueError("other_metrics_to_log must be None, a string, or a list of strings")
+    
+    # Validate that all requested metrics are available
+    from model import calculate_expected_metric
+    available_metrics = ['sharpe_ratio', 'geometric_sharpe_ratio', 'max_drawdown', 
+                        'sortino_ratio', 'geometric_sortino_ratio', 'expected_return', 
+                        'carmdd', 'omega_ratio', 'jensen_alpha', 'treynor_ratio', 
+                        'ulcer_index', 'k_ratio']
+    
+    for metric_name in other_metrics_list:
+        if metric_name not in available_metrics:
+            raise ValueError(f"Unknown metric '{metric_name}'. Available metrics: {available_metrics}")
+    
+    if other_metrics_list:
+        print(f"Additional metrics to log: {other_metrics_list}")
 
     # Set up default paths if not provided
     if log_path is None:
@@ -220,25 +263,88 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
     print(f"Checkpoint frequency: every {checkpoint_frequency} iterations")
     print(f"Log frequency: every {log_frequency} iterations")
 
+    # Enhanced optimizer configuration with parameter grouping
+    print(f"Configuring enhanced optimizer with lr={learning_rate}, weight_decay={weight_decay}")
+    
+    # Parameter grouping: no weight decay on biases and layer norms
+    param_groups = []
+    decay_params = []
+    no_decay_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Don't apply weight decay to biases and layer norm parameters
+            if 'bias' in name or 'norm' in name or 'embedding' in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+    
+    param_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+    
+    # Replace the existing optimizer with enhanced AdamW
+    from torch.optim import AdamW
+    enhanced_optimizer = AdamW(
+        param_groups,
+        lr=learning_rate,
+        betas=(0.9, 0.95),  # Better betas for transformer training
+        eps=1e-7,           # Smaller epsilon for numerical stability
+        weight_decay=weight_decay  # This will be overridden by param groups
+    )
+    
+    print(f"Enhanced optimizer: {len(decay_params)} decay params, {len(no_decay_params)} no-decay params")
+    
+    # Learning rate scheduler with warmup and cosine decay
+    from torch.optim.lr_scheduler import LambdaLR
+    import math
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            # Linear warmup
+            return step / warmup_steps
+        else:
+            # Cosine decay after warmup
+            progress = (step - warmup_steps) / (iterations - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    lr_scheduler = LambdaLR(enhanced_optimizer, lr_lambda)
+    print(f"Learning rate scheduler: {warmup_steps} warmup steps, cosine decay over {iterations} iterations")
+
     # Early stopping setup
     best_loss = float('inf')
     patience_counter = 0
 
-    # Create log with comprehensive training information
-    log = pd.DataFrame(columns=[
-        'iteration', 'loss', 'metric_loss', 'reg_loss', 
-        'loss_aggregation', 'phase', 'batch_size', 'n_cols', 'progress'
-    ])
+    # Gradient accumulation setup
+    print(f"Gradient accumulation: {gradient_accumulation_steps} steps (effective batch size multiplier)")
+    accumulated_loss = 0.0
+    accumulation_step = 0
+    
+    # Initialize variables for final reporting
+    current_iteration_loss = 0.0
+    current_lr = learning_rate
+    effective_batch_size = min_batch_size * gradient_accumulation_steps
+    current_loss_aggregation = 'progressive'
 
-    # Set up learning rate scheduler for stability
+    # Create log with comprehensive training information
+    log_columns = [
+        'iteration', 'loss', 'metric_loss', 'reg_loss', 
+        'loss_aggregation', 'phase', 'batch_size', 'effective_batch_size', 'n_cols', 'progress', 'learning_rate'
+    ]
+    # Add columns for additional metrics
+    log_columns.extend(other_metrics_list)
+    log = pd.DataFrame(columns=log_columns)
+
+    # Set up additional plateau scheduler for fine-tuning (optional, in addition to cosine)
     if use_scheduler:
         from torch.optim.lr_scheduler import ReduceLROnPlateau
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, 
-                                    patience=scheduler_patience, verbose=True, 
-                                    min_lr=1e-7)
-        print(f"Learning rate scheduler enabled with patience={scheduler_patience}")
+        plateau_scheduler = ReduceLROnPlateau(enhanced_optimizer, mode='min', factor=0.5, 
+                                            patience=scheduler_patience, 
+                                            min_lr=1e-7)
+        print(f"Additional plateau scheduler enabled with patience={scheduler_patience}")
     else:
-        scheduler = None
+        plateau_scheduler = None
 
     # Convert DataFrame to numpy array if needed
     if hasattr(data, 'values'):  # Check if it's a DataFrame
@@ -262,19 +368,19 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
             prev_progress = (i - 1) / (iterations - 1) if iterations > 1 else 0
             if loss_aggregation == 'progressive':
                 if prev_progress <= 0.4:
-                    prev_aggregation = 'mae'
+                    prev_aggregation = 'huber'
                 elif prev_progress <= 0.7:
                     prev_aggregation = 'gmae'
                 else:
                     prev_aggregation = 'gmse'
         
         if loss_aggregation == 'progressive':
-            # Phase 1 (0-40%): MAE (most stable, forgiving to outliers)
+            # Phase 1 (0-40%): Huber (stable gradients, robust to outliers)
             # Phase 2 (40-70%): GMAE (balanced, emphasizes consistency)  
             # Phase 3 (70-100%): GMSE (most sensitive, best final performance)
             if progress <= 0.4:
-                current_loss_aggregation = 'mae'
-                phase = "Stability (MAE)"
+                current_loss_aggregation = 'huber'
+                phase = "Stability (Huber)"
             elif progress <= 0.7:
                 current_loss_aggregation = 'gmae'
                 phase = "Balanced (GMAE)"
@@ -323,16 +429,20 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         # Use the create_batch function to get each batch
         past_batch_tensor, future_batch_tensor = create_batch(data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
         
-        # Prepare data in the format expected by update_model
+        # Prepare data in the format expected by update_model with dual-purpose input normalization
         # past_batch_tensor shape: (batch_size, n_cols, past_window_size)
         # future_batch_tensor shape: (batch_size, n_cols, future_window_size)
         
         # Create input vectors for the model:
-        # 1. Scalar input: future_window_size (prediction parameter)
-        # 2. Constraint vector: [max_weight, min_assets, max_assets, sparsity_threshold] (portfolio constraints)
+        # 1. Scalar input: future_window_size (prediction parameter) - both normalized and raw versions
+        # 2. Constraint vector: [max_weight, min_assets, max_assets, sparsity_threshold] - both normalized and raw versions
         
-        # Scalar input for prediction horizon
-        scalar_input = torch.tensor(future_window_size, dtype=torch.float32).unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 1)
+        # Raw scalar input for constraint logic (actual future_window_size value)
+        raw_scalar_input = torch.tensor(future_window_size, dtype=torch.float32)
+        
+        # Normalized scalar input for neural network (scale to reasonable range)
+        # Normalize future_window_size to [0, 1] range assuming max reasonable value of 100
+        normalized_scalar_input = torch.tensor(future_window_size / 100.0, dtype=torch.float32).unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 1)
         
         # Constraint vector for portfolio constraints
         # CRITICAL: Ensure constraints are logically consistent with current batch
@@ -355,21 +465,31 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
             print(f"Warning: max_assets ({effective_max_assets}) < min_assets ({effective_min_assets}). Adjusting...")
             effective_max_assets = max(effective_min_assets, current_n_cols // 2)
 
-        constraint_vector = torch.tensor([
-            max_weight,  # Max weight (0.0-1.0, where 1.0 = unconstrained)
-            effective_min_assets / 100.0,  # Normalize min assets (0-100, where 0 = unconstrained)
-            effective_max_assets / 100.0,  # Normalize max assets (0-100)
-            sparsity_threshold * 100.0  # Scale sparsity threshold (0.01 -> 1.0)
+        # Raw constraint values for constraint enforcement logic
+        raw_constraints = {
+            'max_weight': max_weight,
+            'min_assets': effective_min_assets,
+            'max_assets': effective_max_assets,
+            'sparsity_threshold': sparsity_threshold
+        }
+
+        # Normalized constraint vector for neural network (consistent scale with other inputs)
+        normalized_constraint_vector = torch.tensor([
+            max_weight,  # Max weight already in [0, 1] range
+            effective_min_assets / 100.0,  # Normalize min assets to [0, 1] range
+            effective_max_assets / 100.0,  # Normalize max assets to [0, 1] range
+            sparsity_threshold * 10.0  # Scale sparsity threshold to [0, 1] range (0.01-0.1 → 0.1-1.0)
         ], dtype=torch.float32)
         
-        # Expand constraint vector to batch size
-        constraint_input = constraint_vector.unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 4)
+        # Expand normalized constraint vector to batch size
+        normalized_constraint_input = normalized_constraint_vector.unsqueeze(0).repeat(current_batch_size, 1)  # (batch_size, 4)
         
-        # Format data as dictionaries expected by update_model
+        # Format data as dictionaries expected by update_model (using normalized inputs for neural network)
         past_batch = {
             'matrix_input': past_batch_tensor,  # (batch_size, n_cols, past_window_size)
-            'scalar_input': scalar_input,  # (batch_size, 1) - future_window_size
-            'constraint_input': constraint_input  # (batch_size, 4) - [max_weight, min_assets, max_assets, sparsity]
+            'scalar_input': normalized_scalar_input,  # (batch_size, 1) - normalized future_window_size
+            'constraint_input': normalized_constraint_input,  # (batch_size, 4) - normalized constraints
+            'raw_constraints': raw_constraints  # Raw constraint values for enforcement logic
         }
         
         # For future batch, we need to convert the tensor to returns format
@@ -379,45 +499,112 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
             'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
         }
         
-        # Update model with current loss aggregation method
-        loss_dict = update_model(model=model, optimizer=optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
-                     max_weight=max_weight, min_assets=min_assets, max_assets=max_assets, sparsity_threshold=sparsity_threshold,
-                     loss_aggregation=current_loss_aggregation)
+        # Gradient accumulation: accumulate gradients over multiple sub-batches for larger effective batch size
+        if accumulation_step == 0:
+            # Zero gradients at the start of accumulation cycle
+            enhanced_optimizer.zero_grad()
+        
+        # Update model with current loss aggregation method (accumulate gradients)
+        loss_dict = update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
+                     max_weight=raw_constraints['max_weight'], 
+                     min_assets=raw_constraints['min_assets'], 
+                     max_assets=raw_constraints['max_assets'], 
+                     sparsity_threshold=raw_constraints['sparsity_threshold'],
+                     loss_aggregation=current_loss_aggregation,
+                     gradient_accumulation_steps=gradient_accumulation_steps,
+                     accumulation_step=accumulation_step)
+        
+        # Accumulate loss for logging
+        accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
+        accumulation_step += 1
+        
+        # Apply optimizer step and reset accumulation when cycle is complete
+        if accumulation_step >= gradient_accumulation_steps:
+            # Optimizer step is handled inside update_model for gradient accumulation
+            # Update learning rate schedulers
+            lr_scheduler.step()  # Step the cosine scheduler
+            
+            # Reset accumulation
+            accumulation_step = 0
+            current_iteration_loss = accumulated_loss
+            accumulated_loss = 0.0
+        else:
+            # Still accumulating, use current loss for logging
+            current_iteration_loss = loss_dict['loss']
 
-        # Update learning rate scheduler if enabled
-        if scheduler is not None:
-            scheduler.step(loss_dict['loss'])
+        # Calculate additional metrics if requested
+        additional_metrics = {}
+        if other_metrics_list:
+            try:
+                # Get portfolio weights from the first sample in the batch
+                portfolio_weights = loss_dict['weights'][0]  # Shape: (n_assets,)
+                future_returns = future_batch['returns']  # Shape: (timesteps, n_assets)
+                
+                # Create portfolio time series for additional metric calculations
+                from model import create_portfolio_time_series
+                portfolio_timeseries = create_portfolio_time_series(future_returns, portfolio_weights)
+                
+                # Calculate each additional metric
+                for metric_name in other_metrics_list:
+                    try:
+                        metric_value = calculate_expected_metric(portfolio_timeseries, None, metric_name)
+                        additional_metrics[metric_name] = metric_value.item() if hasattr(metric_value, 'item') else float(metric_value)
+                    except Exception as e:
+                        print(f"Warning: Could not calculate {metric_name}: {e}")
+                        additional_metrics[metric_name] = float('nan')
+                        
+            except Exception as e:
+                print(f"Warning: Could not calculate additional metrics: {e}")
+                # Fill with NaN values if calculation fails
+                for metric_name in other_metrics_list:
+                    additional_metrics[metric_name] = float('nan')
 
-        # Early stopping check
-        current_loss = loss_dict['loss']
-        if current_loss < best_loss - early_stopping_threshold:
-            best_loss = current_loss
+        # Update learning rate schedulers (using enhanced optimizer)
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(current_iteration_loss)
+
+        # Early stopping check (use accumulated loss when available)
+        if current_iteration_loss < best_loss - early_stopping_threshold:
+            best_loss = current_iteration_loss
             patience_counter = 0
         else:
             patience_counter += 1
             
         if patience_counter >= early_stopping_patience:
             print(f"\nEarly stopping triggered at iteration {i + 1}")
-            print(f"Best loss: {best_loss:.6f}, Current loss: {current_loss:.6f}")
+            print(f"Best loss: {best_loss:.6f}, Current loss: {current_iteration_loss:.6f}")
             break
 
+        # Get current learning rate for logging
+        current_lr = lr_scheduler.get_last_lr()[0]
+        
+        # Calculate effective batch size
+        effective_batch_size = current_batch_size * gradient_accumulation_steps
+
         # ALWAYS log to dataframe (complete record for analysis)
-        new_row = pd.DataFrame({
+        new_row_data = {
             'iteration': [i + 1], 
-            'loss': [loss_dict['loss']],
+            'loss': [current_iteration_loss],
             'metric_loss': [loss_dict['metric_loss']],
             'reg_loss': [loss_dict['reg_loss']],
             'loss_aggregation': [current_loss_aggregation],
             'phase': [phase],
             'batch_size': [current_batch_size],
+            'effective_batch_size': [effective_batch_size],
             'n_cols': [current_n_cols],
-            'progress': [progress]
-        })
+            'progress': [progress],
+            'learning_rate': [current_lr]
+        }
+        # Add additional metrics to the row data
+        for metric_name in other_metrics_list:
+            new_row_data[metric_name] = [additional_metrics.get(metric_name, float('nan'))]
+        
+        new_row = pd.DataFrame(new_row_data)
         log = pd.concat([log, new_row], ignore_index=True)
 
         # Console output at specified frequency only
         if (i + 1) % log_frequency == 0:
-            print(f"Iteration {i + 1}/{iterations} | Phase: {phase} | Loss: {loss_dict['loss']:.6f} | Metric: {loss_dict['metric_loss']:.6f} | Agg: {current_loss_aggregation.upper()} | Progress: {progress*100:.1f}%")
+            print(f"Iteration {i + 1}/{iterations} | Phase: {phase} | Loss: {current_iteration_loss:.6f} | Agg: {current_loss_aggregation.upper()} | Progress: {progress*100:.1f}% | LR: {current_lr:.2e} | Eff.Batch: {effective_batch_size}")
 
         # Save model checkpoint at specified frequency
         if (i + 1) % checkpoint_frequency == 0:
@@ -443,7 +630,17 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
 
     end_time = datetime.now()
     print(f"\nTraining completed! Total time: {end_time - start_time}")
-    print(f"Final loss: {loss_dict['loss']:.6f} | Final aggregation: {current_loss_aggregation.upper()}")
+    print(f"Final loss: {current_iteration_loss:.6f} | Final aggregation: {current_loss_aggregation.upper()}")
+    print(f"Final learning rate: {current_lr:.2e} | Final effective batch size: {effective_batch_size}")
+    
+    # Show final values of additional metrics if any
+    if other_metrics_list and additional_metrics:
+        final_metrics_str = " | ".join([f"{name}: {additional_metrics.get(name, float('nan')):.6f}" 
+                                       for name in other_metrics_list 
+                                       if not np.isnan(additional_metrics.get(name, float('nan')))])
+        if final_metrics_str:
+            print(f"Final additional metrics: {final_metrics_str}")
+    
     print(f"Final model saved to: {final_model_filepath}")
     print(f"Training log saved to: {log_filepath}")
     return model
