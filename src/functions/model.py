@@ -771,16 +771,17 @@ def create_portfolio_time_series(stocks_matrix, weights_vector):
     return portfolio_returns
 
 #--------------Objective functions/metrics--------------
-def sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0):
+def sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, trading_days_per_year=252):
     """
-    Calculate Sharpe ratio from a normalized price time series using arithmetic mean.
+    Calculate annualized Sharpe ratio from a normalized price time series.
     
     Args:
         portfolio_price_timeseries: torch tensor of normalized prices (continuation from 1.0)
-        risk_free_rate: risk-free rate (default 0.0)
+        risk_free_rate: annualized risk-free rate (default 0.0)
+        trading_days_per_year: number of trading days per year for annualization (default 252)
     
     Returns:
-        sharpe_ratio: torch scalar
+        sharpe_ratio: torch scalar (annualized)
     """
     # Add 1.0 at the start to represent the normalized reference point
     full_series = torch.cat([torch.tensor([1.0], device=portfolio_price_timeseries.device), 
@@ -790,28 +791,32 @@ def sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0):
     returns = (full_series[1:] / full_series[:-1]) - 1
     
     # Remove the first return (which corresponds to the transition from 1.0)
-    # This brings us back to the original series length
     returns = returns[1:]
     
-    # Calculate arithmetic mean return
+    # Calculate mean and std of returns
     mean_return = returns.mean()
-    
-    # Calculate standard deviation of returns
     std_returns = returns.std()
     
-    # Calculate Sharpe ratio (negative for PyTorch minimization - higher Sharpe is better)
-    return -((mean_return - risk_free_rate) / std_returns)
+    # Annualize the Sharpe ratio: multiply by sqrt(trading_days_per_year)
+    annualization_factor = torch.sqrt(torch.tensor(trading_days_per_year, dtype=torch.float32))
+    
+    # Convert risk_free_rate from annual to daily
+    daily_risk_free_rate = risk_free_rate / trading_days_per_year
+    
+    # Calculate annualized Sharpe ratio (negative for PyTorch minimization)
+    return -((mean_return - daily_risk_free_rate) / std_returns * annualization_factor)
 
-def geometric_sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0):
+def geometric_sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, trading_days_per_year=252):
     """
-    Calculate geometric Sharpe ratio from a normalized price time series using geometric mean.
+    Calculate annualized geometric Sharpe ratio from a normalized price time series.
     
     Args:
         portfolio_price_timeseries: torch tensor of normalized prices (continuation from 1.0)
-        risk_free_rate: risk-free rate (default 0.0)
+        risk_free_rate: annualized risk-free rate (default 0.0)
+        trading_days_per_year: number of trading days per year for annualization (default 252)
     
     Returns:
-        geometric_sharpe_ratio: torch scalar
+        geometric_sharpe_ratio: torch scalar (annualized)
     """
     # Add 1.0 at the start to represent the normalized reference point
     full_series = torch.cat([torch.tensor([1.0], device=portfolio_price_timeseries.device), 
@@ -821,17 +826,22 @@ def geometric_sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0):
     returns = (full_series[1:] / full_series[:-1]) - 1
     
     # Remove the first return (which corresponds to the transition from 1.0)
-    # This brings us back to the original series length
     returns = returns[1:]
     
     # Calculate geometric mean return: (1 + r1) * (1 + r2) * ... * (1 + rn))^(1/n) - 1
     geometric_mean_return = torch.pow(torch.prod(1 + returns), 1.0 / len(returns)) - 1
     
-    # Calculate standard deviation of returns
+    # Annualize the geometric mean return
+    annualized_geometric_return = torch.pow(1 + geometric_mean_return, trading_days_per_year) - 1
+    
+    # Calculate standard deviation of returns (for denominator)
     std_returns = returns.std()
     
-    # Calculate geometric Sharpe ratio (negative for PyTorch minimization - higher Sharpe is better)
-    return -((geometric_mean_return - risk_free_rate) / std_returns)
+    # Annualize the standard deviation
+    annualized_std = std_returns * torch.sqrt(torch.tensor(trading_days_per_year, dtype=torch.float32))
+    
+    # Calculate annualized geometric Sharpe ratio (negative for PyTorch minimization)
+    return -((annualized_geometric_return - risk_free_rate) / annualized_std)
 
 def max_drawdown(portfolio_price_timeseries):
     """
@@ -853,18 +863,19 @@ def max_drawdown(portfolio_price_timeseries):
     # Return the maximum drawdown (positive value - higher drawdown is worse, so no sign change needed)
     return torch.max(drawdowns)
 
-def sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0):
+def sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0, trading_days_per_year=252):
     """
-    Calculate Sortino ratio from a normalized price time series using arithmetic mean.
+    Calculate annualized Sortino ratio from a normalized price time series.
     Only considers downside volatility (negative returns below target).
     
     Args:
         portfolio_price_timeseries: torch tensor of normalized prices (continuation from 1.0)
-        risk_free_rate: risk-free rate (default 0.0)
-        target_return: target return threshold (default 0.0)
+        risk_free_rate: annualized risk-free rate (default 0.0)
+        target_return: daily target return threshold (default 0.0)
+        trading_days_per_year: number of trading days per year for annualization (default 252)
     
     Returns:
-        sortino_ratio: torch scalar
+        sortino_ratio: torch scalar (annualized)
     """
     # Add 1.0 at the start to represent the normalized reference point
     full_series = torch.cat([torch.tensor([1.0], device=portfolio_price_timeseries.device), 
@@ -874,31 +885,34 @@ def sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=
     returns = (full_series[1:] / full_series[:-1]) - 1
     
     # Remove the first return (which corresponds to the transition from 1.0)
-    # This brings us back to the original series length
     returns = returns[1:]
     
-    # Calculate arithmetic mean return
+    # Calculate mean return
     mean_return = returns.mean()
     
     # Calculate downside deviation (only negative returns below target)
     downside_returns = torch.minimum(returns - target_return, torch.tensor(0.0))
     downside_deviation = torch.sqrt(torch.mean(downside_returns ** 2))
     
-    # Calculate Sortino ratio (negative for PyTorch minimization - higher Sortino is better)
-    return -((mean_return - risk_free_rate) / downside_deviation)
+    # Annualize both numerator and denominator
+    annualization_factor = torch.sqrt(torch.tensor(trading_days_per_year, dtype=torch.float32))
+    daily_risk_free_rate = risk_free_rate / trading_days_per_year
+    
+    # Calculate annualized Sortino ratio (negative for PyTorch minimization)
+    return -((mean_return - daily_risk_free_rate) / downside_deviation * annualization_factor)
 
-def geometric_sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0):
+def geometric_sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0, trading_days_per_year=252):
     """
-    Calculate geometric Sortino ratio from a normalized price time series using geometric mean.
-    Only considers downside volatility (negative returns below target).
+    Calculate annualized geometric Sortino ratio from a normalized price time series.
     
     Args:
         portfolio_price_timeseries: torch tensor of normalized prices (continuation from 1.0)
-        risk_free_rate: risk-free rate (default 0.0)
-        target_return: target return threshold (default 0.0)
+        risk_free_rate: annualized risk-free rate (default 0.0)
+        target_return: daily target return threshold (default 0.0)
+        trading_days_per_year: number of trading days per year for annualization (default 252)
     
     Returns:
-        geometric_sortino_ratio: torch scalar
+        geometric_sortino_ratio: torch scalar (annualized)
     """
     # Add 1.0 at the start to represent the normalized reference point
     full_series = torch.cat([torch.tensor([1.0], device=portfolio_price_timeseries.device), 
@@ -908,18 +922,21 @@ def geometric_sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, targ
     returns = (full_series[1:] / full_series[:-1]) - 1
     
     # Remove the first return (which corresponds to the transition from 1.0)
-    # This brings us back to the original series length
     returns = returns[1:]
     
-    # Calculate geometric mean return: (1 + r1) * (1 + r2) * ... * (1 + rn))^(1/n) - 1
+    # Calculate geometric mean return and annualize it
     geometric_mean_return = torch.pow(torch.prod(1 + returns), 1.0 / len(returns)) - 1
+    annualized_geometric_return = torch.pow(1 + geometric_mean_return, trading_days_per_year) - 1
     
     # Calculate downside deviation (only negative returns below target)
     downside_returns = torch.minimum(returns - target_return, torch.tensor(0.0))
     downside_deviation = torch.sqrt(torch.mean(downside_returns ** 2))
     
-    # Calculate geometric Sortino ratio (negative for PyTorch minimization - higher Sortino is better)
-    return -((geometric_mean_return - risk_free_rate) / downside_deviation)
+    # Annualize the downside deviation
+    annualized_downside_deviation = downside_deviation * torch.sqrt(torch.tensor(trading_days_per_year, dtype=torch.float32))
+    
+    # Calculate annualized geometric Sortino ratio (negative for PyTorch minimization)
+    return -((annualized_geometric_return - risk_free_rate) / annualized_downside_deviation)
 
 def expected_return(portfolio_price_timeseries):
     """
@@ -935,22 +952,39 @@ def expected_return(portfolio_price_timeseries):
     # (negative for PyTorch minimization - higher expected return is better)
     return -portfolio_price_timeseries[-1]
 
-def carmdd(portfolio_price_timeseries):
+def carmdd(portfolio_price_timeseries, trading_days_per_year=252):
     """
-    Calculate the Calmar ratio from a normalized price time series.
+    Calculate the Calmar ratio (CARMDD) from a normalized price time series.
+    Uses proper compounding for annualized returns.
     
     Args:
         portfolio_price_timeseries: torch tensor of normalized prices (continuation from 1.0)
+        trading_days_per_year: number of trading days per year for annualization (default 252)
     
     Returns:
         carmdd: torch scalar representing the Calmar ratio
     """
     # Calculate maximum drawdown
-    max_drawdown = torch.max(torch.cummax(portfolio_price_timeseries, dim=0).values - portfolio_price_timeseries)
-    # Calculate expected return
-    expected_return = portfolio_price_timeseries[-1]
+    running_max = torch.cummax(portfolio_price_timeseries, dim=0).values
+    drawdowns = (running_max - portfolio_price_timeseries) / running_max
+    max_drawdown_val = torch.max(drawdowns)
+    
+    # Calculate annualized return using proper compounding
+    # Total return = final_value / initial_value (initial is 1.0)
+    total_return = portfolio_price_timeseries[-1]
+    
+    # Number of periods (days) in the series
+    n_periods = len(portfolio_price_timeseries)
+    
+    # Annualize using compound growth: (1 + total_return)^(252/n_periods) - 1
+    annualized_return = torch.pow(total_return, trading_days_per_year / n_periods) - 1
+    
     # Calculate Calmar ratio (negative for PyTorch minimization - higher Calmar is better)
-    return -(expected_return / max_drawdown) if max_drawdown != 0 else torch.tensor(0.0)
+    # Avoid division by zero
+    if max_drawdown_val > 1e-8:
+        return -(annualized_return / max_drawdown_val)
+    else:
+        return torch.tensor(-1000.0)  # Very high value when no drawdown
 
 def omega_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0):
     """
@@ -1476,7 +1510,7 @@ def huber_loss_aggregation(losses, delta=1.0):
     return torch.sign(losses.mean()) * huber_losses.mean()
 
 
-def update_model(model, optimizer, past_batch, future_batch, metric, 
+def update_model(model, optimizer, past_batch, future_batch, loss, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
                 regularization_lambda=0.0, loss_aggregation='arithmetic', 
                 gradient_accumulation_steps=1, accumulation_step=0, *args, **kwargs):
@@ -1493,7 +1527,7 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
             - 'raw_constraints': Dictionary with raw constraint values for enforcement
         future_batch: Dictionary containing future data for loss calculation:
             - 'returns': Future returns matrix for portfolio evaluation
-        metric: String name of the metric to optimize (e.g., 'sharpe_ratio')
+        loss: String name of the loss function to optimize (e.g., 'sharpe_ratio')
         max_weight: Maximum weight constraint (used with raw constraint values)
         min_assets: Minimum number of assets constraint (used with raw constraint values)
         max_assets: Maximum number of assets constraint (used with raw constraint values)
@@ -1538,8 +1572,8 @@ def update_model(model, optimizer, past_batch, future_batch, metric,
         # Create portfolio time series from weights and future returns
         portfolio_timeseries = create_portfolio_time_series(future_returns, weights[i])
         
-        # Calculate the metric (e.g., Sharpe ratio, etc.)
-        metric_loss = calculate_expected_metric(portfolio_timeseries, None, metric, *args, **kwargs)
+        # Calculate the loss function (e.g., Sharpe ratio, etc.)
+        metric_loss = calculate_expected_metric(portfolio_timeseries, None, loss, *args, **kwargs)
         metric_losses.append(metric_loss)
     
     # Stack all losses

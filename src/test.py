@@ -132,7 +132,7 @@ trained_model = train_model(
     min_batch_size=16,      # Base batch size for CPU training
     max_batch_size=256,     # Maximum physical batch size (memory limited)
     iterations=4000,        # Increased iterations for thorough training
-    metric="expected_return", 
+    loss="expected_return", 
     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],  # Log additional metrics
     loss_aggregation='progressive',  # Progressive curriculum: Huber → GMAE → GMSE for maximum stability
     
@@ -143,7 +143,7 @@ trained_model = train_model(
     gradient_accumulation_steps=32,  # 32x accumulation for ultra-stable training with heterogeneity
                                      # Effective batch sizes: 32×16=512 → 256×32=8192
                                      # This gives 512-8192 effective batch range (ideal for diverse financial scenarios)
-    
+
     # Constraint ranges for random sampling
     max_weight_range=max_weight_range,
     min_assets_range=min_assets_range,

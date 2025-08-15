@@ -135,7 +135,7 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
 
 def train_model(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
-                       metric ='sharpe_ratio', loss_aggregation='progressive',
+                       loss ='sharpe_ratio', loss_aggregation='progressive',
                        # Additional metrics to log
                        other_metrics_to_log=None,
                        # Constraint ranges for random sampling
@@ -167,7 +167,7 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         min_batch_size: Starting batch size
         max_batch_size: Final batch size
         iterations: Total number of iterations
-        metric: Metric to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
+        loss: Loss function to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
         loss_aggregation: Method to aggregate losses across batch
             - 'huber': Huber Loss - robust to outliers (Phase 1 stability)
             - 'mse': Mean Square Error - mean of squared losses  
@@ -203,7 +203,7 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
         ...     data=df, 
         ...     past_window_size=20, 
         ...     future_window_size=10,
-        ...     metric='sharpe_ratio',
+        ...     loss='sharpe_ratio',
         ...     other_metrics_to_log=['max_drawdown', 'sortino_ratio'],  # Log additional metrics
         ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
         ...     learning_rate=1e-3,  # Enhanced optimizer settings
@@ -505,7 +505,7 @@ def train_model(model, optimizer, data, past_window_size, future_window_size, mi
             enhanced_optimizer.zero_grad()
         
         # Update model with current loss aggregation method (accumulate gradients)
-        loss_dict = update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, metric=metric,
+        loss_dict = update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, loss=loss,
                      max_weight=raw_constraints['max_weight'], 
                      min_assets=raw_constraints['min_assets'], 
                      max_assets=raw_constraints['max_assets'], 
