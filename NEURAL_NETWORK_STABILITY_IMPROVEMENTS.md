@@ -89,7 +89,7 @@ Huber(x) = 0.5 * x² for |x| ≤ δ
 
 ## New Function Parameters
 
-### train_model() New Parameters:
+### train_model_progressive() New Parameters:
 ```python
 # Enhanced optimizer configuration
 learning_rate=1e-3,          # Initial learning rate
@@ -109,7 +109,7 @@ gradient_accumulation_steps=4 # Effective batch size multiplier
 
 ### Basic Usage (All Improvements Active):
 ```python
-trained_model = train_model(
+trained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,  # Will be replaced with enhanced AdamW
     data=df,
@@ -125,7 +125,7 @@ trained_model = train_model(
 
 ### Conservative Training (Lower Learning Rate):
 ```python
-trained_model = train_model(
+trained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,
     data=df,
@@ -140,7 +140,7 @@ trained_model = train_model(
 
 ### Fixed Huber Loss Training:
 ```python
-trained_model = train_model(
+trained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,
     data=df,

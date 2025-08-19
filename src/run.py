@@ -7,8 +7,7 @@ import numpy as np
 import pandas as pd
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 
-from model import *
-from data import *
+from functions import *
 
 #%%
 model = build_transformer_model(past_window_size = 200,
@@ -51,7 +50,7 @@ print("Starting training with random constraint sampling...")
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Test training function
-train_model(
+train_model_progressive(
     model=model,
     optimizer=optimizer,
     data=example_data, 

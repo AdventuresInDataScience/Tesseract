@@ -31,7 +31,7 @@ The scalar input contains 5 normalized values with the following defaults for "u
 
 ```python
 # Train with constraints
-trained_model = train_model(
+trained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,
     data=data,
@@ -45,7 +45,7 @@ trained_model = train_model(
 )
 
 # Or train unconstrained (using defaults)
-unconstrained_model = train_model(
+unconstrained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,
     data=data,
