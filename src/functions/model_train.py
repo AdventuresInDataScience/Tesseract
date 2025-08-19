@@ -32,9 +32,9 @@ except ImportError:
         huber_loss_aggregation
     )
 
-#%% --------------- DEPRECATED-----------------
+#%% --------------- SHARED HELPER FUNCTIONS-----------------
 
-def create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices, max_retries=10):
+def _create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices, max_retries=10):
     """
     Create a single sample from the numpy array.
     
@@ -108,8 +108,7 @@ def create_single_sample(data_array, past_window_size, future_window_size, n_col
     
     return sample_array
 
-
-def create_batch(data_array, past_window_size, future_window_size, n_cols, batch_size, valid_indices):
+def _create_batch(data_array, past_window_size, future_window_size, n_cols, batch_size, valid_indices):
     """
     Create a single batch and return past and future tensors.
     
@@ -128,7 +127,7 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
     batch = []
     
     for j in range(batch_size):
-        sample = create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices)
+        sample = _create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices)
         batch.append(sample)
     
     # Convert list of numpy arrays to tensor - automatically gets correct shape!
@@ -140,8 +139,7 @@ def create_batch(data_array, past_window_size, future_window_size, n_cols, batch
     
     return past_batch, future_batch
 
-
-def update_model(model, optimizer, past_batch, future_batch, loss, 
+def _update_model(model, optimizer, past_batch, future_batch, loss, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
                 regularization_lambda=0.0, loss_aggregation='arithmetic', 
                 gradient_accumulation_steps=1, accumulation_step=0, *args, **kwargs):
@@ -262,279 +260,7 @@ def update_model(model, optimizer, past_batch, future_batch, loss,
         'weights': weights.detach()
     }
 
-# Main Progressive Training Function
-def train_model_progressive(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
-                       max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
-                       loss ='sharpe_ratio', loss_aggregation='progressive',
-                       # Additional metrics to log
-                       other_metrics_to_log=None,
-                       # Constraint ranges for random sampling
-                       max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
-                       max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
-                       # Logging and checkpoint paths
-                       log_path=None, checkpoint_path=None,
-                       # Frequency controls
-                       checkpoint_frequency=50, log_frequency=10,
-                       # Stability controls
-                       use_scheduler=True, scheduler_patience=500,
-                       # Early stopping  
-                       early_stopping_patience=2000, early_stopping_threshold=1e-6,
-                       # Enhanced optimizer configuration
-                       learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
-                       # Gradient accumulation for larger effective batch size
-                       gradient_accumulation_steps=4):
-    """
-    Progressive batch creation with curriculum learning, random constraint sampling, and enhanced stability features.
-    Starts with small batch_size and n_cols, gradually increases both.
-    Includes input normalization, Huber loss for Phase 1, enhanced optimizer configuration, and gradient accumulation.
-    
-    Args:
-        data: pandas DataFrame or numpy array of shape (n_timesteps, n_assets)
-        past_window_size: Number of timesteps for past window
-        future_window_size: Number of timesteps for future window
-        min_n_cols: Starting number of columns (assets)
-        max_n_cols: Final number of columns (assets)
-        min_batch_size: Starting batch size
-        max_batch_size: Final batch size
-        iterations: Total number of iterations
-        loss: Loss function to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
-        loss_aggregation: Method to aggregate losses across batch
-            - 'huber': Huber Loss - robust to outliers (Phase 1 stability)
-            - 'mse': Mean Square Error - mean of squared losses  
-            - 'gmae': Geometric Mean Absolute Error - log-space geometric mean (balanced)
-            - 'gmse': Geometric Mean Square Error (most sensitive to outliers)
-            - 'progressive': Progressive curriculum: huber → gmae → gmse (recommended for stability)
-        other_metrics_to_log: Additional metrics to calculate and log alongside the primary metric.
-            Can be a string (single metric) or list of strings (multiple metrics).
-            Available metrics: 'sharpe_ratio', 'geometric_sharpe_ratio', 'max_drawdown', 
-            'sortino_ratio', 'geometric_sortino_ratio', 'expected_return', 'carmdd', 
-            'omega_ratio', 'jensen_alpha', 'treynor_ratio', 'ulcer_index', 'k_ratio'
-        max_weight_range: (min, max) range for max_weight constraint sampling
-        min_assets_range: (min, max) range for min_assets constraint sampling  
-        max_assets_range: (min, max) range for max_assets constraint sampling
-        sparsity_threshold_range: (min, max) range for sparsity_threshold sampling
-        log_path: Path to save training logs (default: repo_root/logs/)
-        checkpoint_path: Path to save model checkpoints (default: repo_root/checkpoints/)
-        checkpoint_frequency: How often to save model checkpoints (default: every 50 iterations)
-        log_frequency: How often to save loss data and print progress (default: every 10 iterations)
-        learning_rate: Initial learning rate for enhanced optimizer (default: 1e-3)
-        weight_decay: L2 regularization for enhanced optimizer (default: 2e-4)
-        warmup_steps: Learning rate warmup steps (default: 500)
-        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size (default: 4)
-        
-    Returns:
-        Trained model
-        
-    Example:
-        >>> # Train with progressive loss aggregation and enhanced stability
-        >>> trained_model = train_model_progressive(
-        ...     model=model, 
-        ...     optimizer=optimizer, 
-        ...     data=df, 
-        ...     past_window_size=20, 
-        ...     future_window_size=10,
-        ...     loss='sharpe_ratio',
-        ...     other_metrics_to_log=['max_drawdown', 'sortino_ratio'],  # Log additional metrics
-        ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
-        ...     learning_rate=1e-3,  # Enhanced optimizer settings
-        ...     weight_decay=2e-4,
-        ...     gradient_accumulation_steps=4,  # 4x larger effective batch size
-        ...     checkpoint_frequency=100,  # Save every 100 iterations
-        ...     log_frequency=20  # Log every 20 iterations
-        ... )
-    """
-    # Start time
-    start_time = datetime.now()
-    print("Training started at", start_time)
-
-    # Process and validate other_metrics_to_log parameter
-    other_metrics_list = _progressive_process_other_metrics(other_metrics_to_log)
-
-    # Set up default paths and create directories
-    log_path, checkpoint_path = _progressive_setup_default_paths(
-        log_path, checkpoint_path, checkpoint_frequency, log_frequency)
-
-    # Set up enhanced optimizer with parameter grouping
-    enhanced_optimizer = _progressive_setup_enhanced_optimizer(model, learning_rate, weight_decay)
-    
-    # Set up learning rate scheduler with warmup and cosine decay
-    lr_scheduler = _progressive_setup_learning_rate_scheduler(enhanced_optimizer, warmup_steps, iterations)
-
-    # Early stopping setup
-    best_loss = float('inf')
-    patience_counter = 0
-
-    # Gradient accumulation setup
-    print(f"Gradient accumulation: {gradient_accumulation_steps} steps (effective batch size multiplier)")
-    accumulated_loss = 0.0
-    accumulation_step = 0
-    
-    # Initialize variables for final reporting
-    current_iteration_loss = 0.0
-    current_lr = learning_rate
-    effective_batch_size = min_batch_size * gradient_accumulation_steps
-    current_loss_aggregation = 'progressive'
-
-    # Create log with comprehensive training information
-    log_columns = [
-        'iteration', 'loss', 'metric_loss', 'reg_loss', 
-        'loss_aggregation', 'phase', 'batch_size', 'effective_batch_size', 'n_cols', 'progress', 'learning_rate'
-    ]
-    log_columns.extend(other_metrics_list)
-    log = pd.DataFrame(columns=log_columns)
-
-    # Set up additional plateau scheduler for fine-tuning
-    plateau_scheduler = _progressive_setup_plateau_scheduler(enhanced_optimizer, use_scheduler, scheduler_patience)
-
-    # Convert DataFrame to numpy array if needed
-    data_array = _progressive_convert_data_to_array(data)
-    
-    valid_indices = len(data_array) - (past_window_size + future_window_size)
-    
-    print(f"Starting training for {iterations} iterations...")
-    
-    # Loop through fixed number of iterations with progressive difficulty
-    for i in range(iterations):
-        # Calculate progressive values (linear interpolation)
-        progress = i / (iterations - 1) if iterations > 1 else 0  # 0 to 1
-        
-        # Determine current loss aggregation method and phase
-        current_loss_aggregation, phase = _progressive_determine_loss_aggregation(
-            loss_aggregation, progress, i)
-
-        # Calculate progressive n_cols and batch_size values
-        current_n_cols, current_batch_size = _progressive_calculate_progressive_values(
-            progress, min_n_cols, max_n_cols, min_batch_size, max_batch_size)
-        
-        # Calculate progressive and random constraint values
-        max_weight, min_assets, max_assets, sparsity_threshold = _progressive_calculate_constraint_values(
-            progress, max_weight_range, min_assets_range, max_assets_range, sparsity_threshold_range)
-        
-        # Use the create_batch function to get each batch
-        past_batch_tensor, future_batch_tensor = create_batch(
-            data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
-        
-        # Validate and adjust constraints to be logically consistent
-        max_weight, effective_min_assets, effective_max_assets, sparsity_threshold = _progressive_validate_constraints(
-            max_weight, min_assets, max_assets, sparsity_threshold, current_n_cols)
-
-        # Create normalized inputs for the model
-        normalized_scalar_input, normalized_constraint_input, raw_constraints = _progressive_create_model_inputs(
-            future_window_size, current_batch_size, max_weight, effective_min_assets, effective_max_assets, sparsity_threshold)
-        
-        # Format data as dictionaries expected by update_model (using normalized inputs for neural network)
-        past_batch = {
-            'matrix_input': past_batch_tensor,  # (batch_size, n_cols, past_window_size)
-            'scalar_input': normalized_scalar_input,  # (batch_size, 1) - normalized future_window_size
-            'constraint_input': normalized_constraint_input,  # (batch_size, 4) - normalized constraints
-            'raw_constraints': raw_constraints  # Raw constraint values for enforcement logic
-        }
-        
-        # For future batch, we need to convert the tensor to returns format
-        # The future_batch_tensor contains normalized price continuations
-        # We need to convert this to a format suitable for portfolio evaluation
-        future_batch = {
-            'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
-        }
-        
-        # Gradient accumulation: accumulate gradients over multiple sub-batches for larger effective batch size
-        if accumulation_step == 0:
-            # Zero gradients at the start of accumulation cycle
-            enhanced_optimizer.zero_grad()
-        
-        # Update model with current loss aggregation method (accumulate gradients)
-        loss_dict = update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, loss=loss,
-                     max_weight=raw_constraints['max_weight'], 
-                     min_assets=raw_constraints['min_assets'], 
-                     max_assets=raw_constraints['max_assets'], 
-                     sparsity_threshold=raw_constraints['sparsity_threshold'],
-                     loss_aggregation=current_loss_aggregation,
-                     gradient_accumulation_steps=gradient_accumulation_steps,
-                     accumulation_step=accumulation_step)
-        
-        # Accumulate loss for logging
-        accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
-        accumulation_step += 1
-        
-        # Apply optimizer step and reset accumulation when cycle is complete
-        if accumulation_step >= gradient_accumulation_steps:
-            # Optimizer step is handled inside update_model for gradient accumulation
-            # Update learning rate schedulers
-            lr_scheduler.step()  # Step the cosine scheduler
-            
-            # Reset accumulation
-            accumulation_step = 0
-            current_iteration_loss = accumulated_loss
-            accumulated_loss = 0.0
-        else:
-            # Still accumulating, use current loss for logging
-            current_iteration_loss = loss_dict['loss']
-
-        # Calculate additional metrics if requested
-        additional_metrics = _progressive_calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
-
-        # Update learning rate schedulers (using enhanced optimizer)
-        if plateau_scheduler is not None:
-            plateau_scheduler.step(current_iteration_loss)
-
-        # Early stopping check (use accumulated loss when available)
-        if current_iteration_loss < best_loss - early_stopping_threshold:
-            best_loss = current_iteration_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= early_stopping_patience:
-            print(f"\nEarly stopping triggered at iteration {i + 1}")
-            print(f"Best loss: {best_loss:.6f}, Current loss: {current_iteration_loss:.6f}")
-            break
-
-        # Get current learning rate for logging
-        current_lr = lr_scheduler.get_last_lr()[0]
-        
-        # Calculate effective batch size
-        effective_batch_size = current_batch_size * gradient_accumulation_steps
-
-        # ALWAYS log to dataframe (complete record for analysis)
-        new_row_data = {
-            'iteration': [i + 1], 
-            'loss': [current_iteration_loss],
-            'metric_loss': [loss_dict['metric_loss']],
-            'reg_loss': [loss_dict['reg_loss']],
-            'loss_aggregation': [current_loss_aggregation],
-            'phase': [phase],
-            'batch_size': [current_batch_size],
-            'effective_batch_size': [effective_batch_size],
-            'n_cols': [current_n_cols],
-            'progress': [progress],
-            'learning_rate': [current_lr]
-        }
-        # Add additional metrics to the row data
-        for metric_name in other_metrics_list:
-            new_row_data[metric_name] = [additional_metrics.get(metric_name, float('nan'))]
-        
-        new_row = pd.DataFrame(new_row_data)
-        log = pd.concat([log, new_row], ignore_index=True)
-
-        # Console output at specified frequency only
-        if (i + 1) % log_frequency == 0:
-            print(f"Iteration {i + 1}/{iterations} | Phase: {phase} | Loss: {current_iteration_loss:.6f} | Agg: {current_loss_aggregation.upper()} | Progress: {progress*100:.1f}% | LR: {current_lr:.2e} | Eff.Batch: {effective_batch_size}")
-
-        # Save model checkpoint at specified frequency
-        if (i + 1) % checkpoint_frequency == 0:
-            checkpoint_filename = f'model_checkpoint_{i + 1}.pt'
-            checkpoint_filepath = os.path.join(checkpoint_path, checkpoint_filename)
-            torch.save(model.state_dict(), checkpoint_filepath)
-
-    # Save final models and logs
-    _progressive_save_final_models_and_logs(
-        model, checkpoint_path, log_path, log, current_iteration_loss, 
-        current_loss_aggregation, current_lr, effective_batch_size, 
-        other_metrics_list, additional_metrics, start_time)
-    
-    return model
-
-#%% --------------- PROGRESSIVE MODEL TRAINING HELPER FUNCTIONS-----------------
+# %% --------------- PROGRESSIVE MODEL TRAINING FUNCTIONS-----------------
 # Private helper functions for progressive training
 def _progressive_process_other_metrics(other_metrics_to_log):
     """Process and validate the other_metrics_to_log parameter."""
@@ -865,7 +591,279 @@ def _progressive_save_final_models_and_logs(model, checkpoint_path, log_path, lo
     print(f"Final model saved to: {final_model_filepath}")
     print(f"Training log saved to: {log_filepath}")
 
-#%% --------------- CURRICULUM MODEL TRAINING HELPER FUNCTIONS-----------------
+# Main Progressive Training Function
+def train_model_progressive(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
+                       max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
+                       loss ='sharpe_ratio', loss_aggregation='progressive',
+                       # Additional metrics to log
+                       other_metrics_to_log=None,
+                       # Constraint ranges for random sampling
+                       max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
+                       max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
+                       # Logging and checkpoint paths
+                       log_path=None, checkpoint_path=None,
+                       # Frequency controls
+                       checkpoint_frequency=50, log_frequency=10,
+                       # Stability controls
+                       use_scheduler=True, scheduler_patience=500,
+                       # Early stopping  
+                       early_stopping_patience=2000, early_stopping_threshold=1e-6,
+                       # Enhanced optimizer configuration
+                       learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
+                       # Gradient accumulation for larger effective batch size
+                       gradient_accumulation_steps=4):
+    """
+    Progressive batch creation with curriculum learning, random constraint sampling, and enhanced stability features.
+    Starts with small batch_size and n_cols, gradually increases both.
+    Includes input normalization, Huber loss for Phase 1, enhanced optimizer configuration, and gradient accumulation.
+    
+    Args:
+        data: pandas DataFrame or numpy array of shape (n_timesteps, n_assets)
+        past_window_size: Number of timesteps for past window
+        future_window_size: Number of timesteps for future window
+        min_n_cols: Starting number of columns (assets)
+        max_n_cols: Final number of columns (assets)
+        min_batch_size: Starting batch size
+        max_batch_size: Final batch size
+        iterations: Total number of iterations
+        loss: Loss function to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
+        loss_aggregation: Method to aggregate losses across batch
+            - 'huber': Huber Loss - robust to outliers (Phase 1 stability)
+            - 'mse': Mean Square Error - mean of squared losses  
+            - 'gmae': Geometric Mean Absolute Error - log-space geometric mean (balanced)
+            - 'gmse': Geometric Mean Square Error (most sensitive to outliers)
+            - 'progressive': Progressive curriculum: huber → gmae → gmse (recommended for stability)
+        other_metrics_to_log: Additional metrics to calculate and log alongside the primary metric.
+            Can be a string (single metric) or list of strings (multiple metrics).
+            Available metrics: 'sharpe_ratio', 'geometric_sharpe_ratio', 'max_drawdown', 
+            'sortino_ratio', 'geometric_sortino_ratio', 'expected_return', 'carmdd', 
+            'omega_ratio', 'jensen_alpha', 'treynor_ratio', 'ulcer_index', 'k_ratio'
+        max_weight_range: (min, max) range for max_weight constraint sampling
+        min_assets_range: (min, max) range for min_assets constraint sampling  
+        max_assets_range: (min, max) range for max_assets constraint sampling
+        sparsity_threshold_range: (min, max) range for sparsity_threshold sampling
+        log_path: Path to save training logs (default: repo_root/logs/)
+        checkpoint_path: Path to save model checkpoints (default: repo_root/checkpoints/)
+        checkpoint_frequency: How often to save model checkpoints (default: every 50 iterations)
+        log_frequency: How often to save loss data and print progress (default: every 10 iterations)
+        learning_rate: Initial learning rate for enhanced optimizer (default: 1e-3)
+        weight_decay: L2 regularization for enhanced optimizer (default: 2e-4)
+        warmup_steps: Learning rate warmup steps (default: 500)
+        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size (default: 4)
+        
+    Returns:
+        Trained model
+        
+    Example:
+        >>> # Train with progressive loss aggregation and enhanced stability
+        >>> trained_model = train_model_progressive(
+        ...     model=model, 
+        ...     optimizer=optimizer, 
+        ...     data=df, 
+        ...     past_window_size=20, 
+        ...     future_window_size=10,
+        ...     loss='sharpe_ratio',
+        ...     other_metrics_to_log=['max_drawdown', 'sortino_ratio'],  # Log additional metrics
+        ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
+        ...     learning_rate=1e-3,  # Enhanced optimizer settings
+        ...     weight_decay=2e-4,
+        ...     gradient_accumulation_steps=4,  # 4x larger effective batch size
+        ...     checkpoint_frequency=100,  # Save every 100 iterations
+        ...     log_frequency=20  # Log every 20 iterations
+        ... )
+    """
+    # Start time
+    start_time = datetime.now()
+    print("Training started at", start_time)
+
+    # Process and validate other_metrics_to_log parameter
+    other_metrics_list = _progressive_process_other_metrics(other_metrics_to_log)
+
+    # Set up default paths and create directories
+    log_path, checkpoint_path = _progressive_setup_default_paths(
+        log_path, checkpoint_path, checkpoint_frequency, log_frequency)
+
+    # Set up enhanced optimizer with parameter grouping
+    enhanced_optimizer = _progressive_setup_enhanced_optimizer(model, learning_rate, weight_decay)
+    
+    # Set up learning rate scheduler with warmup and cosine decay
+    lr_scheduler = _progressive_setup_learning_rate_scheduler(enhanced_optimizer, warmup_steps, iterations)
+
+    # Early stopping setup
+    best_loss = float('inf')
+    patience_counter = 0
+
+    # Gradient accumulation setup
+    print(f"Gradient accumulation: {gradient_accumulation_steps} steps (effective batch size multiplier)")
+    accumulated_loss = 0.0
+    accumulation_step = 0
+    
+    # Initialize variables for final reporting
+    current_iteration_loss = 0.0
+    current_lr = learning_rate
+    effective_batch_size = min_batch_size * gradient_accumulation_steps
+    current_loss_aggregation = 'progressive'
+
+    # Create log with comprehensive training information
+    log_columns = [
+        'iteration', 'loss', 'metric_loss', 'reg_loss', 
+        'loss_aggregation', 'phase', 'batch_size', 'effective_batch_size', 'n_cols', 'progress', 'learning_rate'
+    ]
+    log_columns.extend(other_metrics_list)
+    log = pd.DataFrame(columns=log_columns)
+
+    # Set up additional plateau scheduler for fine-tuning
+    plateau_scheduler = _progressive_setup_plateau_scheduler(enhanced_optimizer, use_scheduler, scheduler_patience)
+
+    # Convert DataFrame to numpy array if needed
+    data_array = _progressive_convert_data_to_array(data)
+    
+    valid_indices = len(data_array) - (past_window_size + future_window_size)
+    
+    print(f"Starting training for {iterations} iterations...")
+    
+    # Loop through fixed number of iterations with progressive difficulty
+    for i in range(iterations):
+        # Calculate progressive values (linear interpolation)
+        progress = i / (iterations - 1) if iterations > 1 else 0  # 0 to 1
+        
+        # Determine current loss aggregation method and phase
+        current_loss_aggregation, phase = _progressive_determine_loss_aggregation(
+            loss_aggregation, progress, i)
+
+        # Calculate progressive n_cols and batch_size values
+        current_n_cols, current_batch_size = _progressive_calculate_progressive_values(
+            progress, min_n_cols, max_n_cols, min_batch_size, max_batch_size)
+        
+        # Calculate progressive and random constraint values
+        max_weight, min_assets, max_assets, sparsity_threshold = _progressive_calculate_constraint_values(
+            progress, max_weight_range, min_assets_range, max_assets_range, sparsity_threshold_range)
+        
+        # Use the create_batch function to get each batch
+        past_batch_tensor, future_batch_tensor = _create_batch(
+            data_array, past_window_size, future_window_size, current_n_cols, current_batch_size, valid_indices)
+        
+        # Validate and adjust constraints to be logically consistent
+        max_weight, effective_min_assets, effective_max_assets, sparsity_threshold = _progressive_validate_constraints(
+            max_weight, min_assets, max_assets, sparsity_threshold, current_n_cols)
+
+        # Create normalized inputs for the model
+        normalized_scalar_input, normalized_constraint_input, raw_constraints = _progressive_create_model_inputs(
+            future_window_size, current_batch_size, max_weight, effective_min_assets, effective_max_assets, sparsity_threshold)
+        
+        # Format data as dictionaries expected by update_model (using normalized inputs for neural network)
+        past_batch = {
+            'matrix_input': past_batch_tensor,  # (batch_size, n_cols, past_window_size)
+            'scalar_input': normalized_scalar_input,  # (batch_size, 1) - normalized future_window_size
+            'constraint_input': normalized_constraint_input,  # (batch_size, 4) - normalized constraints
+            'raw_constraints': raw_constraints  # Raw constraint values for enforcement logic
+        }
+        
+        # For future batch, we need to convert the tensor to returns format
+        # The future_batch_tensor contains normalized price continuations
+        # We need to convert this to a format suitable for portfolio evaluation
+        future_batch = {
+            'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
+        }
+        
+        # Gradient accumulation: accumulate gradients over multiple sub-batches for larger effective batch size
+        if accumulation_step == 0:
+            # Zero gradients at the start of accumulation cycle
+            enhanced_optimizer.zero_grad()
+        
+        # Update model with current loss aggregation method (accumulate gradients)
+        loss_dict = _update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, loss=loss,
+                     max_weight=raw_constraints['max_weight'], 
+                     min_assets=raw_constraints['min_assets'], 
+                     max_assets=raw_constraints['max_assets'], 
+                     sparsity_threshold=raw_constraints['sparsity_threshold'],
+                     loss_aggregation=current_loss_aggregation,
+                     gradient_accumulation_steps=gradient_accumulation_steps,
+                     accumulation_step=accumulation_step)
+        
+        # Accumulate loss for logging
+        accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
+        accumulation_step += 1
+        
+        # Apply optimizer step and reset accumulation when cycle is complete
+        if accumulation_step >= gradient_accumulation_steps:
+            # Optimizer step is handled inside update_model for gradient accumulation
+            # Update learning rate schedulers
+            lr_scheduler.step()  # Step the cosine scheduler
+            
+            # Reset accumulation
+            accumulation_step = 0
+            current_iteration_loss = accumulated_loss
+            accumulated_loss = 0.0
+        else:
+            # Still accumulating, use current loss for logging
+            current_iteration_loss = loss_dict['loss']
+
+        # Calculate additional metrics if requested
+        additional_metrics = _progressive_calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
+
+        # Update learning rate schedulers (using enhanced optimizer)
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(current_iteration_loss)
+
+        # Early stopping check (use accumulated loss when available)
+        if current_iteration_loss < best_loss - early_stopping_threshold:
+            best_loss = current_iteration_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= early_stopping_patience:
+            print(f"\nEarly stopping triggered at iteration {i + 1}")
+            print(f"Best loss: {best_loss:.6f}, Current loss: {current_iteration_loss:.6f}")
+            break
+
+        # Get current learning rate for logging
+        current_lr = lr_scheduler.get_last_lr()[0]
+        
+        # Calculate effective batch size
+        effective_batch_size = current_batch_size * gradient_accumulation_steps
+
+        # ALWAYS log to dataframe (complete record for analysis)
+        new_row_data = {
+            'iteration': [i + 1], 
+            'loss': [current_iteration_loss],
+            'metric_loss': [loss_dict['metric_loss']],
+            'reg_loss': [loss_dict['reg_loss']],
+            'loss_aggregation': [current_loss_aggregation],
+            'phase': [phase],
+            'batch_size': [current_batch_size],
+            'effective_batch_size': [effective_batch_size],
+            'n_cols': [current_n_cols],
+            'progress': [progress],
+            'learning_rate': [current_lr]
+        }
+        # Add additional metrics to the row data
+        for metric_name in other_metrics_list:
+            new_row_data[metric_name] = [additional_metrics.get(metric_name, float('nan'))]
+        
+        new_row = pd.DataFrame(new_row_data)
+        log = pd.concat([log, new_row], ignore_index=True)
+
+        # Console output at specified frequency only
+        if (i + 1) % log_frequency == 0:
+            print(f"Iteration {i + 1}/{iterations} | Phase: {phase} | Loss: {current_iteration_loss:.6f} | Agg: {current_loss_aggregation.upper()} | Progress: {progress*100:.1f}% | LR: {current_lr:.2e} | Eff.Batch: {effective_batch_size}")
+
+        # Save model checkpoint at specified frequency
+        if (i + 1) % checkpoint_frequency == 0:
+            checkpoint_filename = f'model_checkpoint_{i + 1}.pt'
+            checkpoint_filepath = os.path.join(checkpoint_path, checkpoint_filename)
+            torch.save(model.state_dict(), checkpoint_filepath)
+
+    # Save final models and logs
+    _progressive_save_final_models_and_logs(
+        model, checkpoint_path, log_path, log, current_iteration_loss, 
+        current_loss_aggregation, current_lr, effective_batch_size, 
+        other_metrics_list, additional_metrics, start_time)
+    
+    return model
+
+# %% --------------- CURRICULUM MODEL TRAINING HELPER FUNCTIONS-----------------
 # Private helper functions for curriculum training
 def _validate_power_of_2(n):
     """Check if a number is a power of 2."""
@@ -1423,7 +1421,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
             # Create batch using selected columns
             # Note: This is a simplified version - in practice, you'd modify create_batch 
             # to accept specific column indices
-            past_batch_tensor, future_batch_tensor = create_batch(
+            past_batch_tensor, future_batch_tensor = _create_batch(
                 data_array[:, selected_columns], 
                 past_window_size, 
                 batch_future_window, 
@@ -1479,7 +1477,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 enhanced_optimizer.zero_grad()
             
             # Update model
-            loss_dict = update_model(
+            loss_dict = _update_model(
                 model=model, optimizer=enhanced_optimizer, 
                 past_batch=past_batch, future_batch=future_batch, loss=loss,
                 max_weight=raw_constraints['max_weight'], 
