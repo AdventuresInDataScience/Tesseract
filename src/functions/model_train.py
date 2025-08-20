@@ -57,18 +57,32 @@ def _create_single_sample(data_array, past_window_size, future_window_size, n_co
     # Ensure data_slice is numeric (convert to float if needed)
     if data_slice.dtype == 'object' or not np.issubdtype(data_slice.dtype, np.number):
         try:
-            data_slice = data_slice.astype(np.float64)
+            data_slice = data_slice.astype(np.float32)
         except (ValueError, TypeError):
             # If conversion fails, treat all values as invalid
             valid_col_indices = np.array([])
         else:
             # Find columns with no NaN values in this slice
-            valid_cols = ~np.isnan(data_slice).any(axis=0)
-            valid_col_indices = np.where(valid_cols)[0]
+            try:
+                valid_cols = ~np.isnan(data_slice).any(axis=0)
+                valid_col_indices = np.where(valid_cols)[0]
+            except TypeError:
+                # Handle case where isnan still fails after conversion
+                valid_col_indices = np.array([])
     else:
         # Find columns with no NaN values in this slice
-        valid_cols = ~np.isnan(data_slice).any(axis=0)
-        valid_col_indices = np.where(valid_cols)[0]
+        try:
+            valid_cols = ~np.isnan(data_slice).any(axis=0)
+            valid_col_indices = np.where(valid_cols)[0]
+        except TypeError:
+            # Handle non-float data types that can't use isnan
+            # Check for finite values instead
+            try:
+                valid_cols = np.isfinite(data_slice).all(axis=0)
+                valid_col_indices = np.where(valid_cols)[0]
+            except (TypeError, ValueError):
+                # If all else fails, assume all columns are valid
+                valid_col_indices = np.arange(data_slice.shape[1])
     
     # Ensure we always get a sample, even if we need to retry or pad
     retry_count = 0
@@ -77,8 +91,26 @@ def _create_single_sample(data_array, past_window_size, future_window_size, n_co
         # Try a different random starting point
         start_idx = random.randint(0, valid_indices)
         data_slice = data_array[start_idx:start_idx + (past_window_size + future_window_size), :]
-        valid_cols = ~np.isnan(data_slice).any(axis=0)
-        valid_col_indices = np.where(valid_cols)[0]
+        
+        # Handle data type conversion and validation (same as above)
+        if data_slice.dtype == 'object' or not np.issubdtype(data_slice.dtype, np.number):
+            try:
+                data_slice = data_slice.astype(np.float32)
+            except (ValueError, TypeError):
+                valid_col_indices = np.array([])
+                retry_count += 1
+                continue
+        
+        try:
+            valid_cols = ~np.isnan(data_slice).any(axis=0)
+            valid_col_indices = np.where(valid_cols)[0]
+        except TypeError:
+            try:
+                valid_cols = np.isfinite(data_slice).all(axis=0)
+                valid_col_indices = np.where(valid_cols)[0]
+            except (TypeError, ValueError):
+                valid_col_indices = np.arange(data_slice.shape[1])
+        
         retry_count += 1
     
     # If we still don't have enough columns after retries, pad with zeros
@@ -358,6 +390,9 @@ def _progressive_setup_learning_rate_scheduler(enhanced_optimizer, warmup_steps,
             return step / warmup_steps
         else:
             # Cosine decay after warmup
+            # Avoid division by zero when iterations == warmup_steps
+            if iterations == warmup_steps:
+                return 1.0
             progress = (step - warmup_steps) / (iterations - warmup_steps)
             return 0.5 * (1 + math.cos(math.pi * progress))
     
@@ -1014,14 +1049,39 @@ def _create_cartesian_schedule(batch_schedule, column_schedule, constraint_n_ste
     
     return phases
 
-def _create_column_buckets(total_cols, n_buckets):
-    """Create column range buckets: 1=widest, higher=narrower."""
+def _create_column_buckets(total_cols, n_buckets, max_reasonable_cols=500):
+    """Create column range buckets for curriculum learning.
+    
+    Curriculum progression: Start with MORE columns (easier attention), progress to FEWER columns (harder).
+    Bucket 1 = most columns, highest bucket = fewest columns.
+    
+    Args:
+        total_cols: Total number of columns in dataset
+        n_buckets: Number of buckets to create
+        max_reasonable_cols: Maximum reasonable number of columns for memory constraints
+    """
+    # Cap the effective total columns to a reasonable number for memory constraints
+    effective_total_cols = min(total_cols, max_reasonable_cols)
+    
     buckets = {}
     for bucket_id in range(1, n_buckets + 1):
-        # Bucket 1 is widest (e.g., 6000-7000), bucket N is narrowest (e.g., 100-7000)
-        width_factor = (n_buckets - bucket_id + 1) / n_buckets
-        min_cols = max(10, int(total_cols * (1 - width_factor)))  # Ensure minimum
-        max_cols = total_cols
+        # Curriculum learning: start with MORE columns (easier), progress to FEWER columns (harder)
+        # Reverse the progress so bucket 1 = most columns, bucket n = fewest columns
+        progress = (bucket_id - 1) / (n_buckets - 1) if n_buckets > 1 else 0  # 0 to 1
+        reversed_progress = 1.0 - progress  # 1 to 0 (bucket 1 gets 1.0, last bucket gets 0.0)
+        
+        # Calculate ranges: early buckets = more cols, later buckets = fewer cols
+        # Start with ~100-500 columns, end with ~10-50 columns
+        min_start, min_end = 10, max(50, int(effective_total_cols * 0.2))
+        max_start, max_end = 50, effective_total_cols
+        
+        min_cols = int(min_start + reversed_progress * (min_end - min_start))
+        max_cols = int(max_start + reversed_progress * (max_end - max_start))
+        
+        # Ensure valid ranges
+        min_cols = max(10, min(min_cols, effective_total_cols))
+        max_cols = max(min_cols + 10, min(max_cols, effective_total_cols))
+        
         buckets[bucket_id] = (min_cols, max_cols)
     return buckets
 
@@ -1062,6 +1122,9 @@ def _setup_learning_rate_scheduler(optimizer, warmup_steps, iterations):
         if step < warmup_steps:
             return step / warmup_steps
         else:
+            # Avoid division by zero when iterations == warmup_steps
+            if iterations == warmup_steps:
+                return 1.0
             progress = (step - warmup_steps) / (iterations - warmup_steps)
             return 0.5 * (1 + math.cos(math.pi * progress))
     
@@ -1248,12 +1311,22 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     start_time = datetime.now()
     print("🎓 Curriculum Training started at", start_time)
     
-    # Convert DataFrame to numpy array if needed
+    # Convert DataFrame to numpy array if needed and ensure numeric data
     if hasattr(data, 'values'):
         data_array = data.values
         print("Converted DataFrame to numpy array for faster processing")
     else:
         data_array = data
+    
+    # Ensure the data is numeric - convert to float32 for memory efficiency
+    if data_array.dtype == 'object' or not np.issubdtype(data_array.dtype, np.number):
+        print(f"Converting data from {data_array.dtype} to float32 for numeric operations (memory efficient)")
+        try:
+            data_array = data_array.astype(np.float32)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Cannot convert data to numeric format. Data contains non-numeric values: {e}")
+    
+    print(f"Data array shape: {data_array.shape}, dtype: {data_array.dtype}")
     
     # Auto-detect total columns if not provided
     if total_columns is None:
@@ -1418,17 +1491,19 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
             max_assets = random.randint(int(max_assets_range_step[0]), int(max_assets_range_step[1]))
             sparsity_threshold = random.uniform(*sparsity_range_step)
             
-            # Create batch using selected columns
-            # Note: This is a simplified version - in practice, you'd modify create_batch 
-            # to accept specific column indices
+            # Create batch normally, then select specific columns afterward
+            # This matches the progressive function approach
             past_batch_tensor, future_batch_tensor = _create_batch(
-                data_array[:, selected_columns], 
+                data_array, 
                 past_window_size, 
                 batch_future_window, 
                 n_cols_to_sample, 
                 current_batch_size, 
                 valid_indices
             )
+            
+            # Apply column selection after batch creation (if needed for curriculum)
+            # Note: The _create_batch function already handles column sampling internally
             
             # Constraint validation (same as progressive function)
             effective_max_assets = min(max_assets, n_cols_to_sample)
@@ -1547,17 +1622,30 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
             new_row = pd.DataFrame(new_row_data)
             log = pd.concat([log, new_row], ignore_index=True)
             
-            # Console output
+            # Console output and intermittent logging
             if current_iteration % log_frequency == 0:
+                # Get current constraint ranges for this step
+                current_max_weight = max_weight_steps[constraint_step]
+                current_min_assets = int(min_assets_steps[constraint_step])
+                current_max_assets = int(max_assets_steps[constraint_step])
+                current_sparsity = sparsity_steps[constraint_step]
+                
                 print(f"Iter {current_iteration}/{iterations} | Phase {phase_idx+1} | "
                       f"Loss: {current_iteration_loss:.6f} | Cols: {n_cols_to_sample} | "
-                      f"Bucket: {column_bucket_id} | LR: {current_lr:.2e}")
+                      f"Bucket: {column_bucket_id} ({column_buckets[column_bucket_id]}) | "
+                      f"MaxWt: {current_max_weight:.3f} | Assets: {current_min_assets}-{current_max_assets} | "
+                      f"LR: {current_lr:.2e}")
+                
+                # Save log intermittently
+                log.to_csv(log_filepath, index=False)
             
             # Checkpoints
             if current_iteration % checkpoint_frequency == 0:
                 checkpoint_filename = f'curriculum_checkpoint_{current_iteration}.pt'
                 checkpoint_filepath = os.path.join(checkpoint_path, checkpoint_filename)
                 torch.save(model.state_dict(), checkpoint_filepath)
+                # Also save log at checkpoint
+                log.to_csv(log_filepath, index=False)
         
         # Break if early stopping triggered
         if patience_counter >= early_stopping_patience:

@@ -25,18 +25,23 @@ def geometric_mean_absolute_error_aggregation(losses, epsilon=1e-8):
     Aggregate losses using geometric mean absolute error with numerical stability.
     
     This uses log-space operations for numerical stability when computing geometric means.
+    For financial losses that are negative (good), preserve the sign in the result.
     
     Args:
         losses: Tensor of shape (batch_size,) containing individual losses
         epsilon: Small constant for numerical stability
     
     Returns:
-        Geometric mean of absolute losses using log-space operations
+        Geometric mean of absolute losses using log-space operations,
+        with sign preserved for negative losses
     
     Mathematical approach:
     geometric_mean = exp(mean(log(abs(losses) + epsilon)))
     But implemented using logsumexp for numerical stability.
     """
+    # Check if all losses are negative (financial case - preserve sign)
+    all_negative = torch.all(losses < 0)
+    
     # Take absolute value and add epsilon for stability
     abs_losses = torch.abs(losses) + epsilon
     
@@ -47,20 +52,31 @@ def geometric_mean_absolute_error_aggregation(losses, epsilon=1e-8):
     mean_log_loss = torch.mean(log_losses)
     
     # Convert back from log space
-    return torch.exp(mean_log_loss)
+    geometric_mean = torch.exp(mean_log_loss)
+    
+    # If all losses were negative (financial case), preserve the negative sign
+    if all_negative:
+        geometric_mean = -geometric_mean
+    
+    return geometric_mean
 
 
 def geometric_mean_square_error_aggregation(losses, epsilon=1e-8):
     """
     Aggregate losses using geometric mean square error with numerical stability.
+    For financial losses that are negative (good), preserve the sign in the result.
     
     Args:
         losses: Tensor of shape (batch_size,) containing individual losses
         epsilon: Small constant for numerical stability
     
     Returns:
-        Geometric mean of squared losses using log-space operations
+        Geometric mean of squared losses using log-space operations,
+        with sign preserved for negative losses
     """
+    # Check if all losses are negative (financial case - preserve sign)
+    all_negative = torch.all(losses < 0)
+    
     # Square the losses and add epsilon for stability
     squared_losses = losses ** 2 + epsilon
     
@@ -71,7 +87,13 @@ def geometric_mean_square_error_aggregation(losses, epsilon=1e-8):
     mean_log_squared_loss = torch.mean(log_squared_losses)
     
     # Convert back from log space
-    return torch.exp(mean_log_squared_loss)
+    geometric_mean_squared = torch.exp(mean_log_squared_loss)
+    
+    # If all losses were negative (financial case), preserve the negative sign
+    if all_negative:
+        geometric_mean_squared = -geometric_mean_squared
+    
+    return geometric_mean_squared
 
 
 def huber_loss_aggregation(losses, delta=1.0):
@@ -80,25 +102,35 @@ def huber_loss_aggregation(losses, delta=1.0):
     
     Huber loss is quadratic for small errors and linear for large errors,
     making it robust to outliers while maintaining smooth gradients.
+    For financial losses that are negative (good), preserve the sign in the result.
     
     Args:
         losses: Tensor of shape (batch_size,) containing individual losses
         delta: Threshold for switching between quadratic and linear regions
     
     Returns:
-        Mean Huber loss
+        Mean Huber loss with sign preserved for negative losses
     """
+    # Check if all losses are negative (financial case - preserve sign)
+    all_negative = torch.all(losses < 0)
+    
     abs_losses = torch.abs(losses)
     
     # For |loss| <= delta: 0.5 * loss^2
     # For |loss| > delta: delta * (|loss| - 0.5 * delta)
     huber_losses = torch.where(
         abs_losses <= delta,
-        0.5 * losses ** 2,
-        delta * (abs_losses - 0.5 * delta)
+        0.5 * losses ** 2,  # This keeps the squared term positive
+        delta * (abs_losses - 0.5 * delta)  # This keeps the linear term positive
     )
     
-    return torch.mean(huber_losses)
+    mean_huber = torch.mean(huber_losses)
+    
+    # If all losses were negative (financial case), preserve the negative sign
+    if all_negative:
+        mean_huber = -mean_huber
+    
+    return mean_huber
 
 
 def get_loss_aggregation_function(aggregation_method: str):

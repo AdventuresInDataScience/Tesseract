@@ -60,7 +60,6 @@ timeseries = df.drop(columns=['report_date']).values
 past_window_size = 65
 future_window_size = 21
 
-# IMPORTANT: Split data into train/test sets
 # Split into training and testing
 split_ratio = 0.8
 split_index = int(len(timeseries) * split_ratio)
