@@ -248,14 +248,16 @@ def carmdd(portfolio_price_timeseries, trading_days_per_year=252):
     max_drawdown_val = torch.max(drawdowns)
     
     # Calculate annualized return using proper compounding
-    # Total return = final_value / initial_value (initial is 1.0)
-    total_return = portfolio_price_timeseries[-1]
+    # Total return ratio = final_value / initial_value (initial is 1.0, so just final value)
+    total_return_ratio = portfolio_price_timeseries[-1]
     
     # Number of periods (days) in the series
     n_periods = len(portfolio_price_timeseries)
     
-    # Annualize using compound growth: (1 + total_return)^(252/n_periods) - 1
-    annualized_return = torch.pow(total_return, trading_days_per_year / n_periods) - 1
+    # Annualize using compound growth: (final/initial)^(252/n_periods) - 1
+    # Since portfolio_price_timeseries already represents the ratio from initial value 1.0,
+    # we use it directly as the total return ratio
+    annualized_return = torch.pow(total_return_ratio, trading_days_per_year / n_periods) - 1
     
     # Calculate Calmar ratio (negative for PyTorch minimization - higher Calmar is better)
     # Avoid division by zero

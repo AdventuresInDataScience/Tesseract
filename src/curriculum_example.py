@@ -45,7 +45,7 @@ model = build_transformer_model(
     past_window_size=past_window_size,
     d_model=256,
     n_heads=8,
-    n_transformer_blocks=6,
+    n_transformer_blocks=2,
     d_ff=1024,
     max_n=n_assets,
     activation='hard_mish'
@@ -64,15 +64,22 @@ optimizer = create_adam_optimizer(model, lr=1e-3, weight_decay=2e-4)
 
 # Shorter test schedule (comment out for full training):
 batch_schedule = {
-    32: 50,    # Phase 1: Small batches (reduced)
-    64: 75,    # Phase 2: Medium batches (reduced)
-    128: 75    # Phase 3: Large batches (reduced)
+    32: 640,    # Phase 1: Small batches (reduced)
+    64: 1280,    # Phase 2: Medium batches (reduced)
+    128: 1920    # Phase 3: Large batches (reduced)
 }
 
 column_schedule = {
-    1: 60,     # Phase 1: Wide asset buckets (reduced)
-    2: 70,     # Phase 2: Medium buckets (reduced)
-    3: 70      # Phase 3: Narrow buckets (reduced)
+    1: 720,
+    2: 720,
+    3: 480,
+    4: 480,
+    5: 240,
+    6: 240,
+    7: 240,
+    8: 240,
+    9: 240,
+    10: 240
 }
 
 # Constraint ranges for progressive expansion
@@ -106,17 +113,17 @@ trained_model = train_model_curriculum(
     # Training parameters
     iterations=sum(batch_schedule.values()),  # Total: 2000 iterations
     loss="expected_return",
-    loss_aggregation='progressive',
+    loss_aggregation= 'gmse', #'progressive',
     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
     
     # Enhanced stability
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=300,
-    gradient_accumulation_steps=16,
+    gradient_accumulation_steps=32,
     
     # Logging
-    checkpoint_frequency=100,
+    checkpoint_frequency=250,
     log_frequency=25
 )
 
@@ -138,7 +145,7 @@ trained_model = train_model_curriculum(
     max_assets_range=(10, 100),
     sparsity_threshold_range=(0.001, 0.05),
     future_window_range=(5, 50),
-    iterations=10,
+    iterations=30,
     loss="expected_return",
     loss_aggregation='gmse',
     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
@@ -231,3 +238,51 @@ print("✓ Enhanced stability: 16x gradient accumulation")
 print("✓ Out-of-sample testing: Conservative & aggressive portfolios validated")
 print("✓ Model saved and validated successfully")
 print("="*50)
+
+#%% - Test Corrected Logging (Small Demo)
+print("="*60)
+print("TESTING CORRECTED LOGGING BEHAVIOR - ALL COLUMNS")
+print("="*60)
+print("Expected behavior:")
+print("- With gradient_accumulation_steps=2, logs appear on iterations 2, 4, 6, 8, 10")
+print("- Formula: (iteration % gradient_accumulation_steps == 0)")
+print("- ALL columns should have values (no empty cells):")
+print("  * Constraint ranges: 'max_weight_range': '0.100-0.300'")
+print("  * Specific values: 'max_weight_used': 0.234")
+print("  * Metrics: 'sharpe_ratio': 1.234, 'carmdd': 5.678")
+print("- Console shows actual values used for each iteration")
+print("\nRunning small test with 6 iterations...")
+
+# Small test to demonstrate corrected logging
+test_model = train_model_curriculum(
+    model=model,
+    optimizer=optimizer,
+    data=train_data,
+    past_window_size=past_window_size,
+    min_batch_size=32,
+    max_batch_size=64,
+    n_column_buckets=3,
+    constraint_n_steps=3,
+    max_weight_range=(0.1, 0.3),
+    min_assets_range=(3, 8),
+    max_assets_range=(8, 25),
+    sparsity_threshold_range=(0.001, 0.01),
+    future_window_range=(5, 15),
+    iterations=6,  # Small test - should produce 3 log entries (iterations 2, 4, 6)
+    loss="expected_return",
+    loss_aggregation='huber',
+    other_metrics_to_log=['sharpe_ratio', 'carmdd'],  # Test both metrics
+    learning_rate=1e-3,
+    weight_decay=2e-4,
+    warmup_steps=1,
+    gradient_accumulation_steps=2,  # Log on iterations 2, 4, 6
+    checkpoint_frequency=100,
+    log_frequency=1  # Log every gradient update
+)
+
+print("="*60)
+print("LOGGING TEST COMPLETED")
+print("Expected: 3 log entries (iterations 2, 4, 6)")
+print("Formula used: (iteration % gradient_accumulation_steps == 0)")
+print("ALL columns should contain values - no empty cells!")
+print("="*60)
