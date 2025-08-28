@@ -38,8 +38,7 @@ from datetime import datetime
 
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 
-from model import *
-from data import *
+from functions import *
 
 # #%%
 # # Setting up the environment for S&P 500 stock prices
@@ -61,7 +60,6 @@ timeseries = df.drop(columns=['report_date']).values
 past_window_size = 65
 future_window_size = 21
 
-# IMPORTANT: Split data into train/test sets
 # Split into training and testing
 split_ratio = 0.8
 split_index = int(len(timeseries) * split_ratio)
@@ -87,8 +85,8 @@ model = build_transformer_model(
     activation='hard_mish'  # Hard Mish - computational proxy for Mish activation
 )
 
-#2. Build Optimizer (note: this will be replaced by enhanced AdamW in train_model)
-# The train_model function now creates its own enhanced optimizer with parameter grouping
+#2. Build Optimizer (note: this will be replaced by enhanced AdamW in train_model_progressive)
+# The train_model_progressive function now creates its own enhanced optimizer with parameter grouping
 # This optimizer is kept here for compatibility but will be replaced during training
 optimizer = create_adam_optimizer(model, lr=5e-5, weight_decay=5e-5)  # Will be replaced automatically
 
@@ -121,7 +119,7 @@ sparsity_threshold_range = (0.001, 0.05)  # Sparsity threshold: 0.1%-5%
 # %% - Test Training (using only training data with enhanced stability features)
 # Train the model with enhanced stability improvements using ONLY the training data
 print("Starting training with enhanced stability features and random constraint sampling on training data only...")
-trained_model = train_model(
+trained_model = train_model_progressive(
     model=model,
     optimizer=optimizer,  # Will be replaced with enhanced AdamW automatically
     data=train_data, # Use only training data

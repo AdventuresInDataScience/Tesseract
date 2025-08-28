@@ -45,8 +45,6 @@ from .model_prediction import (
 )
 
 from .model_train import (
-    train_model,
-    update_model,
-    create_single_sample,
-    create_batch
+    train_model_progressive,
+    train_model_curriculum
 )

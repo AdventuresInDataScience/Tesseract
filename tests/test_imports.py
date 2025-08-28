@@ -4,7 +4,7 @@ Test imports for the reorganized Tesseract functions.
 """
 
 try:
-    from src.functions import build_transformer_model, train_model, predict_portfolio_weights
+    from src.functions import build_transformer_model, train_model_progressive, predict_portfolio_weights
     print("✅ All main imports successful!")
     
     from src.functions import (
