@@ -135,12 +135,11 @@ trained_model = train_model_progressive(
     loss_aggregation='progressive',  # Progressive curriculum: Huber → GMAE → GMSE for maximum stability
     
     # Enhanced stability parameters optimized for financial data
-    learning_rate=2e-3,              # Higher LR possible with large effective batches
+    learning_rate=2e-3,              # Higher LR possible with memory-efficient training
     weight_decay=2e-4,               # Proper L2 regularization
-    warmup_steps=1000,               # Longer warmup for large effective batches
-    gradient_accumulation_steps=32,  # 32x accumulation for ultra-stable training with heterogeneity
-                                     # Effective batch sizes: 32×16=512 → 256×32=8192
-                                     # This gives 512-8192 effective batch range (ideal for diverse financial scenarios)
+    warmup_steps=1000,               # Longer warmup for stability
+                                     # Large batch sizes: 32 → 256 now directly supported
+                                     # Memory-efficient processing enables batch sizes up to 1024+
 
     # Constraint ranges for random sampling
     max_weight_range=max_weight_range,

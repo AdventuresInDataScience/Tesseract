@@ -6,7 +6,7 @@ Uses structured phase progression instead of random sampling:
 - Batch progression: 32 → 64 → 128 (coordinated with column phases)
 - Column buckets: Wide → Medium → Narrow asset sampling
 - Constraint expansion: Tight → Loose constraints over 5 steps
-- Enhanced stability: Progressive loss aggregation + 16x gradient accumulation
+- Enhanced stability: Progressive loss aggregation + memory-efficient training
 """
 import sys
 import os
@@ -16,6 +16,7 @@ import pandas as pd
 
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 from functions import *
+from functions.training_logger import create_curriculum_logger
 
 #%% - Data preparation and train/test split
 try:
@@ -95,39 +96,62 @@ constraint_config = {
 
 
 # %% Curriculum Training
-print("Starting curriculum training...")
+# print("Starting curriculum training...")
 
-trained_model = train_model_curriculum(
-    model=model,
-    optimizer=optimizer,
-    data=train_data,
-    past_window_size=past_window_size,
-    
-    # Curriculum schedules
-    batch_schedule=batch_schedule,
-    column_schedule=column_schedule,
-    
-    # Constraint progression
-    **constraint_config,
-    
-    # Training parameters
-    iterations=sum(batch_schedule.values()),  # Total: 2000 iterations
-    loss="expected_return",
-    loss_aggregation= 'gmse', #'progressive',
-    other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
-    
-    # Enhanced stability
-    learning_rate=1e-3,
-    weight_decay=2e-4,
-    warmup_steps=300,
-    gradient_accumulation_steps=32,
-    
-    # Logging
-    checkpoint_frequency=250,
-    log_frequency=25
-)
+# # DEMONSTRATION: New TrainingLogger in action
+# print("\n" + "="*60)
+# print("🆕 DEMONSTRATING NEW TRAININGLOGGER")
+# print("="*60)
 
-print("Curriculum training completed!")
+# # Create a logger instance to show the new system
+# demo_logger = create_curriculum_logger(
+#     log_frequency=25,
+#     checkpoint_frequency=250,
+#     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd']
+# )
+
+# print("✅ TrainingLogger successfully initialized!")
+# print("📊 This logger will provide:")
+# print("   • Centralized, consistent logging")
+# print("   • Automatic CSV generation with comprehensive metrics")
+# print("   • Smart checkpoint management")
+# print("   • Clean separation of training logic from logging")
+# print("   • Easy extensibility for new training methods")
+# print()
+# print("🔄 Now running your existing training with current logging...")
+# print("="*60)
+
+# trained_model = train_model_curriculum(
+#     model=model,
+#     optimizer=optimizer,
+#     data=train_data,
+#     past_window_size=past_window_size,
+    
+#     # Curriculum schedules
+#     batch_schedule=batch_schedule,
+#     column_schedule=column_schedule,
+#     max_reasonable_cols=5000,  # Allow up to 5000 columns (instead of default 500)
+    
+#     # Constraint progression
+#     **constraint_config,
+    
+#     # Training parameters
+#     iterations=sum(batch_schedule.values()),  # Total: 2000 iterations
+#     loss="expected_return",
+#     loss_aggregation= 'gmse', #'progressive',
+#     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
+    
+#     # Enhanced stability
+#     learning_rate=1e-3,
+#     weight_decay=2e-4,
+#     warmup_steps=300,
+    
+#     # Logging
+#     checkpoint_frequency=250,
+#     log_frequency=25
+# )
+
+# print("Curriculum training completed!")
 
 # %% Alternative training without dictionary schedules
 print("Starting alternative training without dictionary schedules...")
@@ -145,14 +169,13 @@ trained_model = train_model_curriculum(
     max_assets_range=(10, 100),
     sparsity_threshold_range=(0.001, 0.05),
     future_window_range=(5, 50),
-    iterations=30,
+    iterations=60,
     loss="expected_return",
     loss_aggregation='gmse',
     other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=1,
-    gradient_accumulation_steps=2,
     checkpoint_frequency=100,
     log_frequency=25
 )
@@ -234,18 +257,18 @@ print("\n" + "="*50)
 print("SUMMARY:")
 print("✓ Curriculum training: Batch (32→64→128) × Column buckets (3 phases)")
 print("✓ Progressive loss aggregation: Huber → GMAE → GMSE")
-print("✓ Enhanced stability: 16x gradient accumulation")
+print("✓ Memory-efficient training: Large batch sizes supported")
 print("✓ Out-of-sample testing: Conservative & aggressive portfolios validated")
 print("✓ Model saved and validated successfully")
 print("="*50)
 
 #%% - Test Corrected Logging (Small Demo)
 print("="*60)
-print("TESTING CORRECTED LOGGING BEHAVIOR - ALL COLUMNS")
+print("TESTING UPDATED TRAINING - MEMORY EFFICIENT")
 print("="*60)
 print("Expected behavior:")
-print("- With gradient_accumulation_steps=2, logs appear on iterations 2, 4, 6, 8, 10")
-print("- Formula: (iteration % gradient_accumulation_steps == 0)")
+print("- Large batch sizes now possible due to memory-efficient processing")
+print("- Training logs every iteration (no gradient accumulation)")
 print("- ALL columns should have values (no empty cells):")
 print("  * Constraint ranges: 'max_weight_range': '0.100-0.300'")
 print("  * Specific values: 'max_weight_used': 0.234")
@@ -253,7 +276,7 @@ print("  * Metrics: 'sharpe_ratio': 1.234, 'carmdd': 5.678")
 print("- Console shows actual values used for each iteration")
 print("\nRunning small test with 6 iterations...")
 
-# Small test to demonstrate corrected logging
+# Small test to demonstrate memory-efficient training
 test_model = train_model_curriculum(
     model=model,
     optimizer=optimizer,
@@ -262,27 +285,27 @@ test_model = train_model_curriculum(
     min_batch_size=32,
     max_batch_size=64,
     n_column_buckets=3,
+    max_reasonable_cols=5000,  # Allow up to 5000 columns (instead of default 500)
     constraint_n_steps=3,
     max_weight_range=(0.1, 0.3),
     min_assets_range=(3, 8),
     max_assets_range=(8, 25),
     sparsity_threshold_range=(0.001, 0.01),
     future_window_range=(5, 15),
-    iterations=6,  # Small test - should produce 3 log entries (iterations 2, 4, 6)
+    iterations=6,  # Small test - will produce 6 log entries (every iteration)
     loss="expected_return",
     loss_aggregation='huber',
     other_metrics_to_log=['sharpe_ratio', 'carmdd'],  # Test both metrics
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=1,
-    gradient_accumulation_steps=2,  # Log on iterations 2, 4, 6
     checkpoint_frequency=100,
-    log_frequency=1  # Log every gradient update
+    log_frequency=1  # Log every iteration
 )
 
 print("="*60)
-print("LOGGING TEST COMPLETED")
-print("Expected: 3 log entries (iterations 2, 4, 6)")
-print("Formula used: (iteration % gradient_accumulation_steps == 0)")
+print("MEMORY-EFFICIENT TRAINING TEST COMPLETED")
+print("Expected: 6 log entries (every iteration)")
+print("Large batch sizes now supported due to memory efficiency!")
 print("ALL columns should contain values - no empty cells!")
 print("="*60)

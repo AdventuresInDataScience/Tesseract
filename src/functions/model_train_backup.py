@@ -32,7 +32,7 @@ except ImportError:
         geometric_mean_square_error_aggregation,
         huber_loss_aggregation
     )
-    from .logging import TrainingLogger
+    from logging import TrainingLogger
 
 #%% --------------- SHARED HELPER FUNCTIONS-----------------
 
@@ -175,10 +175,9 @@ def _create_batch(data_array, past_window_size, future_window_size, n_cols, batc
 
 def _update_model(model, optimizer, past_batch, future_batch, loss, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
-                regularization_lambda=0.0, loss_aggregation='arithmetic', 
-                gradient_accumulation_steps=1, accumulation_step=0, *args, **kwargs):
+                regularization_lambda=0.0, loss_aggregation='arithmetic', *args, **kwargs):
     """
-    Perform forward and backward pass to update the model with gradient accumulation support.
+    Perform forward and backward pass to update the model.
     
     Args:
         model: The GPT2LikeTransformer model to update
@@ -202,8 +201,6 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
             - 'huber': Huber Loss - robust to outliers (good for Phase 1 stability)
             - 'gmae' or 'geometric': Geometric Mean Absolute Error - log-space geometric mean
             - 'gmse' or 'geometric_mse': Geometric Mean Square Error
-        gradient_accumulation_steps: Number of steps to accumulate gradients
-        accumulation_step: Current step in the accumulation cycle
         *args, **kwargs: Additional arguments passed to metric calculation
     
     Returns:
@@ -272,19 +269,14 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
     # Total loss (currently just metric loss)
     total_loss = metric_loss  # + regularization_lambda * reg_loss
     
-    # Scale loss by accumulation steps for gradient accumulation
-    scaled_loss = total_loss / gradient_accumulation_steps
+    # Backward pass
+    total_loss.backward()
     
-    # Backward pass (accumulate gradients)
-    scaled_loss.backward()
+    # Gradient clipping for stability (very important for transformer training)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     
-    # Apply optimizer step only on the last accumulation step
-    if (accumulation_step + 1) % gradient_accumulation_steps == 0:
-        # Gradient clipping for stability (very important for transformer training)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        # Update parameters
-        optimizer.step()
+    # Update parameters
+    optimizer.step()
     
     # Return loss information and weights (using unscaled loss for logging)
     return {
@@ -605,7 +597,7 @@ def _progressive_calculate_additional_metrics(other_metrics_list, loss_dict, fut
     return additional_metrics
 
 def _progressive_save_final_models_and_logs(model, checkpoint_path, log_path, log, current_iteration_loss, 
-                                          current_loss_aggregation, current_lr, effective_batch_size, 
+                                          current_loss_aggregation, current_lr, final_batch_size, 
                                           other_metrics_list, additional_metrics, start_time):
     """Save final models and logs."""
     import pandas as pd
@@ -632,7 +624,7 @@ def _progressive_save_final_models_and_logs(model, checkpoint_path, log_path, lo
     end_time = datetime.now()
     print(f"\nTraining completed! Total time: {end_time - start_time}")
     print(f"Final loss: {current_iteration_loss:.6f} | Final aggregation: {current_loss_aggregation.upper()}")
-    print(f"Final learning rate: {current_lr:.2e} | Final effective batch size: {effective_batch_size}")
+    print(f"Final learning rate: {current_lr:.2e} | Final batch size: {final_batch_size}")
     
     # Show final values of additional metrics if any
     if other_metrics_list and additional_metrics:
@@ -663,16 +655,11 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
                        # Early stopping  
                        early_stopping_patience=2000, early_stopping_threshold=1e-6,
                        # Enhanced optimizer configuration
-                       learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
-                       # Gradient accumulation for larger effective batch size
-                       gradient_accumulation_steps=4):
+                       learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500):
     """
     Progressive batch creation with curriculum learning, random constraint sampling, and enhanced stability features.
     Starts with small batch_size and n_cols, gradually increases both.
-    Includes input normalization, Huber loss for Phase 1, enhanced optimizer configuration, and gradient accumulation.
-    
-    NOTE: Logging occurs only after gradient updates (every gradient_accumulation_steps iterations) to ensure
-    meaningful loss values. This reduces log size and focuses on actual optimization steps.
+    Includes input normalization, Huber loss for Phase 1, and enhanced optimizer configuration.
     
     Args:
         data: pandas DataFrame or numpy array of shape (n_timesteps, n_assets)
@@ -707,7 +694,6 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
         learning_rate: Initial learning rate for enhanced optimizer (default: 1e-3)
         weight_decay: L2 regularization for enhanced optimizer (default: 2e-4)
         warmup_steps: Learning rate warmup steps (default: 500)
-        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size (default: 4)
             NOTE: Logging only occurs after complete gradient update cycles to show meaningful loss values.
         
     Returns:
@@ -726,12 +712,12 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
         ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
         ...     learning_rate=1e-3,  # Enhanced optimizer settings
         ...     weight_decay=2e-4,
-        ...     gradient_accumulation_steps=4,  # 4x larger effective batch size
+        ...     max_batch_size=1024,  # Large batch sizes are now possible due to memory efficiency
         ...     checkpoint_frequency=100,  # Save every 100 iterations
         ...     log_frequency=20  # Log every 20 iterations
         ... )
     """
-    # Initialize the logger (replaces embedded logging setup)
+    # Initialize the logger
     logger = TrainingLogger(log_path=log_path, checkpoint_path=checkpoint_path, 
                            log_frequency=log_frequency, checkpoint_frequency=checkpoint_frequency)
     logger.log_start(iterations)
@@ -808,62 +794,27 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
             'returns': future_batch_tensor[0].T  # Use first sample, transpose to (timesteps, n_assets)
         }
         
-        # Gradient accumulation: accumulate gradients over multiple sub-batches for larger effective batch size
-        if accumulation_step == 0:
-            # Zero gradients at the start of accumulation cycle
-            enhanced_optimizer.zero_grad()
+        # Zero gradients before each iteration
+        enhanced_optimizer.zero_grad()
         
-        # Update model with current loss aggregation method (accumulate gradients)
+        # Update model with current loss aggregation method
         loss_dict = _update_model(model=model, optimizer=enhanced_optimizer, past_batch=past_batch, future_batch=future_batch, loss=loss,
                      max_weight=raw_constraints['max_weight'], 
                      min_assets=raw_constraints['min_assets'], 
                      max_assets=raw_constraints['max_assets'], 
                      sparsity_threshold=raw_constraints['sparsity_threshold'],
-                     loss_aggregation=current_loss_aggregation,
-                     gradient_accumulation_steps=gradient_accumulation_steps,
-                     accumulation_step=accumulation_step)
+                     loss_aggregation=current_loss_aggregation)
         
-        # Accumulate loss for logging
-        accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
-        accumulation_step += 1
-        
-        # Apply optimizer step and reset accumulation when cycle is complete
-        gradient_update_occurred = False
-        if accumulation_step >= gradient_accumulation_steps:
-            # Optimizer step is handled inside update_model for gradient accumulation
-            # Update learning rate schedulers
-            lr_scheduler.step()  # Step the cosine scheduler
-            
-            # Reset accumulation
-            accumulation_step = 0
-            current_iteration_loss = accumulated_loss
-            accumulated_loss = 0.0
-            gradient_update_occurred = True
-        else:
-            # Still accumulating, use current loss for logging
-            current_iteration_loss = loss_dict['loss']
+        # Update learning rate schedulers
+        lr_scheduler.step()  # Step the cosine scheduler
+        current_iteration_loss = loss_dict['loss']
 
-        # Calculate additional metrics for this iteration
+        # Calculate additional metrics
         additional_metrics = _progressive_calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
 
         # Update learning rate schedulers (using enhanced optimizer)
         if plateau_scheduler is not None:
             plateau_scheduler.step(current_iteration_loss)
-
-        # Early stopping check (use accumulated loss when available)
-        if current_iteration_loss < best_loss - early_stopping_threshold:
-            best_loss = current_iteration_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= early_stopping_patience:
-            print(f"\nEarly stopping triggered at iteration {i + 1}")
-            print(f"Best loss: {best_loss:.6f}, Current loss: {current_iteration_loss:.6f}")
-            break
-
-        # Get current learning rate for logging
-        current_lr = lr_scheduler.get_last_lr()[0]
 
         # Early stopping check
         if current_iteration_loss < best_loss - early_stopping_threshold:
@@ -875,6 +826,9 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
         if patience_counter >= early_stopping_patience:
             logger.log_early_stopping(i + 1, best_loss, current_iteration_loss)
             break
+
+        # Get current learning rate for logging
+        current_lr = lr_scheduler.get_last_lr()[0]
 
         # Prepare training parameters for logging
         training_params = {
@@ -902,9 +856,7 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
 
         # Use logger for iteration logging and checkpointing
         logger.log_iteration(i + 1, loss_dict, training_params)
-        logger.checkpoint_model(model, i + 1)
-
-    # Finalize training with logger
+        logger.checkpoint_model(model, i + 1)    # Finalize training with logger
     final_metrics = {
         'final_loss': current_iteration_loss,
         'final_aggregation': current_loss_aggregation,
@@ -1257,6 +1209,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                            # Curriculum scheduling parameters
                            batch_schedule=None, n_batch_phases=3, min_batch_size=32, max_batch_size=256,
                            column_schedule=None, n_column_buckets=4, total_columns=None,
+                           max_reasonable_cols=500,
                            constraint_n_steps=5, max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
                            max_assets_range=(5, 200), sparsity_threshold_range=(0.005, 0.05),
                            future_window_range=(5, 50),
@@ -1273,15 +1226,10 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                            # Early stopping  
                            early_stopping_patience=2000, early_stopping_threshold=1e-6,
                            # Enhanced optimizer configuration
-                           learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
-                           # Gradient accumulation for larger effective batch size
-                           gradient_accumulation_steps=4):
+                           learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500):
     """
     Curriculum-based training with structured phase progression, bootstrap column sampling, and coordinated scheduling.
     Uses cartesian product approach to create sequential phases with different parameters.
-    
-    NOTE: Logging occurs only after gradient updates (every gradient_accumulation_steps iterations) to ensure
-    meaningful loss values. This reduces log size and focuses on actual optimization steps.
     
     Args:
         model: The GPT2LikeTransformer model to train
@@ -1300,6 +1248,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
             Example: {1: 200, 2: 300, 3: 500} where 1=widest bucket, higher=narrower
         n_column_buckets: Number of column buckets to auto-generate if column_schedule=None
         total_columns: Total number of columns in dataset (auto-detected if None)
+        max_reasonable_cols: Maximum reasonable number of columns for memory constraints (default: 500)
         
         constraint_n_steps: Number of constraint expansion steps (from narrow to wide ranges)
         max_weight_range: (min, max) range for max_weight constraint expansion
@@ -1324,8 +1273,6 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
         learning_rate: Initial learning rate for enhanced optimizer
         weight_decay: L2 regularization for enhanced optimizer
         warmup_steps: Learning rate warmup steps
-        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size
-            NOTE: Logging only occurs after complete gradient update cycles to show meaningful loss values.
         
     Returns:
         Trained model
@@ -1400,7 +1347,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
               f"Constraint={phase['constraint_step']}, Iterations={phase['iterations']}")
     
     # Create column bucket definitions
-    column_buckets = _create_column_buckets(total_columns, max(column_schedule.keys()))
+    column_buckets = _create_column_buckets(total_columns, max(column_schedule.keys()), max_reasonable_cols)
     print(f"\n🗂️  Column buckets:")
     for bucket_id, (min_cols, max_cols) in column_buckets.items():
         print(f"  Bucket {bucket_id}: {min_cols}-{max_cols} columns")
@@ -1428,28 +1375,11 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     if other_metrics_list:
         print(f"Additional metrics to log: {other_metrics_list}")
     
-    # Set up default paths (same as progressive function)
-    if log_path is None:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.dirname(os.path.dirname(current_dir))
-        log_path = os.path.join(repo_root, "logs")
-    
-    if checkpoint_path is None:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.dirname(os.path.dirname(current_dir))
-        checkpoint_path = os.path.join(repo_root, "checkpoints")
-    
-    os.makedirs(log_path, exist_ok=True)
-    os.makedirs(checkpoint_path, exist_ok=True)
-    
-    print(f"\n📁 Logs: {log_path}")
-    print(f"📁 Checkpoints: {checkpoint_path}")
-    
-    # Set up log file path for intermediate logging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f'curriculum_training_log_{timestamp}.csv'
-    log_filepath = os.path.join(log_path, log_filename)
-    
+    # Initialize the logger
+    logger = TrainingLogger(log_path=log_path, checkpoint_path=checkpoint_path, 
+                           log_frequency=log_frequency, checkpoint_frequency=checkpoint_frequency)
+    logger.log_start(iterations)
+
     # Set up enhanced optimizer and schedulers
     print(f"\n⚙️  Configuring enhanced optimizer with lr={learning_rate}, weight_decay={weight_decay}")
     enhanced_optimizer = _setup_enhanced_optimizer(model, learning_rate, weight_decay)
@@ -1459,16 +1389,6 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     # Early stopping and gradient accumulation setup
     best_loss = float('inf')
     patience_counter = 0
-    accumulated_loss = 0.0
-    accumulation_step = 0
-    
-    # Initialize training logger
-    training_logger = TrainingLogger(
-        log_path=log_path,
-        checkpoint_path=checkpoint_path,
-        log_frequency=log_frequency,
-        checkpoint_frequency=checkpoint_frequency
-    )
     
     # Bootstrap state for column sampling
     bootstrap_sampler = _BootstrapColumnSampler(total_columns)
@@ -1484,11 +1404,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     for phase_idx, phase in enumerate(phases):
         print(f"\n🎯 PHASE {phase_idx + 1}/{len(phases)}: Batch={phase['batch_size']}, "
               f"Column={phase['column_bucket']}, Constraint={phase['constraint_step']}")
-        print(f"   Iterations: {phase['iterations']} | Effective batch size: {phase['batch_size'] * gradient_accumulation_steps}")
-        
-        # Reset everything for new phase
-        enhanced_optimizer.zero_grad()
-        accumulation_step = 0
+        print(f"   Iterations: {phase['iterations']} | Batch size: {phase['batch_size']}")
         
         # Get phase parameters
         current_batch_size = phase['batch_size']
@@ -1590,9 +1506,8 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 'returns': future_batch_tensor[0].T
             }
             
-            # Gradient accumulation
-            if accumulation_step == 0:
-                enhanced_optimizer.zero_grad()
+            # Zero gradients before each iteration
+            enhanced_optimizer.zero_grad()
             
             # Update model
             loss_dict = _update_model(
@@ -1602,29 +1517,13 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 min_assets=raw_constraints['min_assets'], 
                 max_assets=raw_constraints['max_assets'], 
                 sparsity_threshold=raw_constraints['sparsity_threshold'],
-                loss_aggregation=current_loss_aggregation,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                accumulation_step=accumulation_step
+                loss_aggregation=current_loss_aggregation
             )
             
-            # Handle gradient accumulation
-            accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
-            accumulation_step += 1
+            # Update learning rate scheduler
+            lr_scheduler.step()
+            current_iteration_loss = loss_dict['loss']
             
-            gradient_update_occurred = False
-            if accumulation_step >= gradient_accumulation_steps:
-                lr_scheduler.step()
-                accumulation_step = 0
-                current_iteration_loss = accumulated_loss
-                accumulated_loss = 0.0
-                gradient_update_occurred = True
-            else:
-                current_iteration_loss = loss_dict['loss']
-            
-            # Calculate additional metrics for this iteration
-            additional_metrics = _calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
-            
-            # Learning rate schedulers
             if plateau_scheduler is not None:
                 plateau_scheduler.step(current_iteration_loss)
             
@@ -1636,30 +1535,45 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 patience_counter += 1
                 
             if patience_counter >= early_stopping_patience:
-                print(f"\n⏹️  Early stopping triggered at iteration {current_iteration}")
+                print(f"\nEarly stopping triggered at iteration {current_iteration}")
                 print(f"Best loss: {best_loss:.6f}, Current loss: {current_iteration_loss:.6f}")
                 break
-            
-            # Get current learning rate
+
+            # Calculate additional metrics
+            additional_metrics = _progressive_calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
+
+            # Get current learning rate for logging
             current_lr = lr_scheduler.get_last_lr()[0]
-            effective_batch_size = current_batch_size * gradient_accumulation_steps
-            
-            # Prepare training parameters for logger
+
+            # Early stopping check
+            if current_iteration_loss < best_loss - early_stopping_threshold:
+                best_loss = current_iteration_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= early_stopping_patience:
+                logger.log_early_stopping(current_iteration, best_loss, current_iteration_loss)
+                break
+
+            # Prepare training parameters for logging
             training_params = {
-                'phase': f"{phase_idx + 1}",
-                'learning_rate': current_lr,
-                'batch_size': current_batch_size,
-                'effective_batch_size': effective_batch_size,
-                'column_bucket': column_bucket_id,
-                'n_cols_sampled': n_cols_to_sample,
-                'future_window_size': batch_future_window,
                 'loss_aggregation': current_loss_aggregation,
+                'phase': phase_name,
+                'batch_size': current_batch_size,
+                'n_cols': n_cols_to_sample,
+                'progress': progress,
+                'learning_rate': current_lr,
+                'column_bucket': column_bucket_id,
                 'constraint_step': constraint_step,
+                'future_window_size': batch_future_window,
+                # Add constraint ranges for context
                 'max_weight_range': f"{max_weight_range_step[0]:.3f}-{max_weight_range_step[1]:.3f}",
-                'min_assets_range': f"{int(min_assets_range_step[0])}-{int(min_assets_range_step[1])}",
-                'max_assets_range': f"{int(max_assets_range_step[0])}-{int(max_assets_range_step[1])}",
+                'min_assets_range': f"{min_assets_range_step[0]}-{min_assets_range_step[1]}",
+                'max_assets_range': f"{max_assets_range_step[0]}-{max_assets_range_step[1]}",
                 'sparsity_threshold_range': f"{sparsity_range_step[0]:.3f}-{sparsity_range_step[1]:.3f}",
                 'future_window_range': f"{future_window_range[0]}-{future_window_range[1]}",
+                # Add actual constraint values used for this specific iteration
                 'max_weight_used': raw_constraints['max_weight'],
                 'min_assets_used': raw_constraints['min_assets'],
                 'max_assets_used': raw_constraints['max_assets'],
@@ -1667,28 +1581,21 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 'future_window_used': batch_future_window
             }
             
-            # Add additional metrics to training_params
-            training_params.update(additional_metrics)
-            
-            # Log this iteration with TrainingLogger
-            training_logger.log_iteration(
-                iteration=current_iteration,
-                loss_dict=loss_dict,
-                training_params=training_params
-            )
-            
-            # Checkpoint based on iteration count
-            if current_iteration % checkpoint_frequency == 0:
-                training_logger.checkpoint_model(model, current_iteration)
-        
-        # Break if early stopping triggered
-        if patience_counter >= early_stopping_patience:
-            break
-    
-    # Finalize training with TrainingLogger
-    final_metrics = {'final_loss': current_iteration_loss}
-    log_filepath = training_logger.finalize_training(model, final_metrics)
-    
-    print(f"Total phases executed: {phase_idx + 1}/{len(phases)}")
-    
+            # Add additional metrics to training params
+            for metric_name in other_metrics_list:
+                training_params[metric_name] = additional_metrics.get(metric_name, float('nan'))
+
+            # Use logger for iteration logging and checkpointing
+            logger.log_iteration(current_iteration, loss_dict, training_params)
+            logger.checkpoint_model(model, current_iteration)
+
+    # Finalize training with logger
+    final_metrics = {
+        'final_loss': current_iteration_loss if 'current_iteration_loss' in locals() else 0.0,
+        'final_aggregation': current_loss_aggregation if 'current_loss_aggregation' in locals() else 'unknown',
+        'final_lr': current_lr if 'current_lr' in locals() else 0.0,
+        'final_batch_size': current_batch_size if 'current_batch_size' in locals() else 0
+    }
+    logger.finalize_training(model, final_metrics)
+
     return model

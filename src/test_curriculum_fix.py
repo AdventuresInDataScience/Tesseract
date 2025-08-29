@@ -61,7 +61,6 @@ try:
         learning_rate=1e-3,
         weight_decay=2e-4,
         warmup_steps=1,
-        gradient_accumulation_steps=1,
         checkpoint_frequency=1,
         log_frequency=1
     )
