@@ -18,8 +18,13 @@ def winsorize_losses(tensor, lower_percentile=1, upper_percentile=98):
     Returns:
         Winsorized tensor.
     """
-    lower_bound = torch.percentile(tensor, lower_percentile)
-    upper_bound = torch.percentile(tensor, upper_percentile)
+    # Convert percentiles to quantiles (0-1 range)
+    lower_quantile = lower_percentile / 100.0
+    upper_quantile = upper_percentile / 100.0
+    
+    # Use torch.quantile instead of torch.percentile
+    lower_bound = torch.quantile(tensor, lower_quantile)
+    upper_bound = torch.quantile(tensor, upper_quantile)
     return torch.clamp(tensor, min=lower_bound, max=upper_bound)
 
 # --- Loss Aggregation Functions ---

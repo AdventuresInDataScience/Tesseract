@@ -21,10 +21,10 @@ try:
         geometric_mean_absolute_error_aggregation,
         geometric_mean_square_error_aggregation,
         huber_loss_aggregation,
-        get_loss_aggregation_function
+        get_loss_aggregation_function,
         winsorize_losses
     )
-    from .logging import TrainingLogger
+    from .training_logger import TrainingLogger
 except ImportError:
     # Fallback for when running as standalone module
     from loss_metrics import create_portfolio_time_series, calculate_expected_metric
@@ -33,9 +33,10 @@ except ImportError:
         geometric_mean_absolute_error_aggregation,
         geometric_mean_square_error_aggregation,
         huber_loss_aggregation,
-        get_loss_aggregation_function
+        get_loss_aggregation_function,
+        winsorize_losses
     )
-    from .logging import TrainingLogger
+    from .training_logger import TrainingLogger
 
 #%% --------------- SHARED HELPER FUNCTIONS-----------------
 
@@ -1272,15 +1273,10 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                            # Early stopping  
                            early_stopping_patience=2000, early_stopping_threshold=1e-6,
                            # Enhanced optimizer configuration
-                           learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500,
-                           # Gradient accumulation for larger effective batch size
-                           gradient_accumulation_steps=4):
+                           learning_rate=1e-3, weight_decay=2e-4, warmup_steps=500):
     """
     Curriculum-based training with structured phase progression, bootstrap column sampling, and coordinated scheduling.
     Uses cartesian product approach to create sequential phases with different parameters.
-    
-    NOTE: Logging occurs only after gradient updates (every gradient_accumulation_steps iterations) to ensure
-    meaningful loss values. This reduces log size and focuses on actual optimization steps.
     
     Args:
         model: The GPT2LikeTransformer model to train
@@ -1323,8 +1319,6 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
         learning_rate: Initial learning rate for enhanced optimizer
         weight_decay: L2 regularization for enhanced optimizer
         warmup_steps: Learning rate warmup steps
-        gradient_accumulation_steps: Steps to accumulate gradients for larger effective batch size
-            NOTE: Logging only occurs after complete gradient update cycles to show meaningful loss values.
         
     Returns:
         Trained model
@@ -1455,19 +1449,21 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     lr_scheduler = _setup_learning_rate_scheduler(enhanced_optimizer, warmup_steps, iterations)
     plateau_scheduler = _setup_plateau_scheduler(enhanced_optimizer, use_scheduler, scheduler_patience)
     
-    # Early stopping and gradient accumulation setup
+    # Early stopping setup
     best_loss = float('inf')
     patience_counter = 0
-    accumulated_loss = 0.0
-    accumulation_step = 0
     
     # Initialize training logger
     training_logger = TrainingLogger(
         log_path=log_path,
         checkpoint_path=checkpoint_path,
         log_frequency=log_frequency,
-        checkpoint_frequency=checkpoint_frequency
+        checkpoint_frequency=checkpoint_frequency,
+        training_type="curriculum"
     )
+    
+    # Start training session
+    training_logger.start_training(iterations)
     
     # Bootstrap state for column sampling
     bootstrap_sampler = _BootstrapColumnSampler(total_columns)
@@ -1483,11 +1479,10 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
     for phase_idx, phase in enumerate(phases):
         print(f"\n🎯 PHASE {phase_idx + 1}/{len(phases)}: Batch={phase['batch_size']}, "
               f"Column={phase['column_bucket']}, Constraint={phase['constraint_step']}")
-        print(f"   Iterations: {phase['iterations']} | Effective batch size: {phase['batch_size'] * gradient_accumulation_steps}")
+        print(f"   Iterations: {phase['iterations']} | Batch size: {phase['batch_size']}")
         
-        # Reset everything for new phase
+        # Reset optimizer for new phase
         enhanced_optimizer.zero_grad()
-        accumulation_step = 0
         
         # Get phase parameters
         current_batch_size = phase['batch_size']
@@ -1589,11 +1584,10 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 'returns': future_batch_tensor[0].T
             }
             
-            # Gradient accumulation
-            if accumulation_step == 0:
-                enhanced_optimizer.zero_grad()
+            # Zero gradients before each update
+            enhanced_optimizer.zero_grad()
             
-            # Update model
+            # Update model (no gradient accumulation - direct update each iteration)
             loss_dict = _update_model(
                 model=model, optimizer=enhanced_optimizer, 
                 past_batch=past_batch, future_batch=future_batch, loss=loss,
@@ -1602,23 +1596,13 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 max_assets=raw_constraints['max_assets'], 
                 sparsity_threshold=raw_constraints['sparsity_threshold'],
                 loss_aggregation=current_loss_aggregation,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                accumulation_step=accumulation_step
+                gradient_accumulation_steps=1,  # No accumulation
+                accumulation_step=0  # Always first step since no accumulation
             )
             
-            # Handle gradient accumulation
-            accumulated_loss += loss_dict['loss'] / gradient_accumulation_steps
-            accumulation_step += 1
-            
-            gradient_update_occurred = False
-            if accumulation_step >= gradient_accumulation_steps:
-                lr_scheduler.step()
-                accumulation_step = 0
-                current_iteration_loss = accumulated_loss
-                accumulated_loss = 0.0
-                gradient_update_occurred = True
-            else:
-                current_iteration_loss = loss_dict['loss']
+            # Step the learning rate scheduler after each update
+            lr_scheduler.step()
+            current_iteration_loss = loss_dict['loss']
             
             # Calculate additional metrics for this iteration
             additional_metrics = _calculate_additional_metrics(other_metrics_list, loss_dict, future_batch)
@@ -1641,14 +1625,12 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
             
             # Get current learning rate
             current_lr = lr_scheduler.get_last_lr()[0]
-            effective_batch_size = current_batch_size * gradient_accumulation_steps
             
             # Prepare training parameters for logger
             training_params = {
                 'phase': f"{phase_idx + 1}",
                 'learning_rate': current_lr,
                 'batch_size': current_batch_size,
-                'effective_batch_size': effective_batch_size,
                 'column_bucket': column_bucket_id,
                 'n_cols_sampled': n_cols_to_sample,
                 'future_window_size': batch_future_window,

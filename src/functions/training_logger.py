@@ -65,6 +65,7 @@ class TrainingLogger:
         self.log_data = []
         self.best_loss = float('inf')
         self.iteration_count = 0
+        self.total_iterations = 0  # Initialize total_iterations
         
         # Setup log file path
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

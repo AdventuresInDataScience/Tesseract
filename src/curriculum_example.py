@@ -160,8 +160,8 @@ trained_model = train_model_curriculum(
     optimizer=optimizer,
     data=train_data,
     past_window_size=past_window_size,
-    min_batch_size=32,
-    max_batch_size=128,
+    min_batch_size=1024,
+    max_batch_size=4096,
     n_column_buckets=10,
     constraint_n_steps=10,
     max_weight_range=(0.05, 0.4),
@@ -171,13 +171,13 @@ trained_model = train_model_curriculum(
     future_window_range=(5, 50),
     iterations=60,
     loss="expected_return",
-    loss_aggregation='gmse',
-    other_metrics_to_log=['max_drawdown', 'sharpe_ratio', 'carmdd'],
+    loss_aggregation='standardized_gmae',
+    other_metrics_to_log=['gmae', 'sharpe_ratio', 'carmdd'],
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=1,
-    checkpoint_frequency=100,
-    log_frequency=25
+    checkpoint_frequency=6,
+    log_frequency=4
 )
 
 
