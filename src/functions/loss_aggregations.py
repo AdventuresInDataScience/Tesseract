@@ -5,8 +5,24 @@ Contains methods for aggregating individual losses across batches.
 
 import torch
 import math
+# --- Winsorization for outlier handling ---
+def winsorize_losses(tensor, lower_percentile=1, upper_percentile=98):
+    """
+    Apply winsorization to a tensor by clipping its values at specified percentiles.
+    
+    Args:
+        tensor: Input tensor to be winsorized.
+        lower_percentile: Lower percentile for clipping (default 1).
+        upper_percentile: Upper percentile for clipping (default 98).
+    
+    Returns:
+        Winsorized tensor.
+    """
+    lower_bound = torch.percentile(tensor, lower_percentile)
+    upper_bound = torch.percentile(tensor, upper_percentile)
+    return torch.clamp(tensor, min=lower_bound, max=upper_bound)
 
-
+# --- Loss Aggregation Functions ---
 def mean_square_error_aggregation(losses):
     """
     Calculate Mean Square Error (MSE) aggregation.
@@ -18,7 +34,6 @@ def mean_square_error_aggregation(losses):
         Mean of squared losses
     """
     return torch.mean(losses ** 2)
-
 
 def geometric_mean_absolute_error_aggregation(losses, epsilon=1e-8):
     """
@@ -60,7 +75,6 @@ def geometric_mean_absolute_error_aggregation(losses, epsilon=1e-8):
     
     return geometric_mean
 
-
 def geometric_mean_square_error_aggregation(losses, epsilon=1e-8):
     """
     Aggregate losses using geometric mean square error with numerical stability.
@@ -94,7 +108,6 @@ def geometric_mean_square_error_aggregation(losses, epsilon=1e-8):
         geometric_mean_squared = -geometric_mean_squared
     
     return geometric_mean_squared
-
 
 def huber_loss_aggregation(losses, delta=1.0):
     """
@@ -132,7 +145,57 @@ def huber_loss_aggregation(losses, delta=1.0):
     
     return mean_huber
 
+def standardized_geometric_mean_error_aggregation(losses):
+    """
+    Aggregate losses using standardized geometric mean error.
+    
+    This function computes the geometric mean absolute error and normalizes it
+    by the standard deviation of the losses to reduce sensitivity to variance.
+    The standard deviation is clamped to prevent division by very small values
+    or excessive normalization from very large values.
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses
+    
+    Returns:
+        Standardized geometric mean error (geometric mean / clamped std dev)
+    """
+    geom_return = geometric_mean_absolute_error_aggregation(losses)
+    std_dev = torch.std(losses)
+    std_dev = torch.clamp(std_dev, min=0.003, max=2.0)  # clamp from 0.003 to 2
+    return geom_return / std_dev
 
+def sortino_geometric_mean_error_aggregation(losses, target=1.0):
+    """
+    Aggregate losses using Sortino-style geometric mean error.
+    
+    This function computes the geometric mean absolute error and normalizes it
+    by the downside standard deviation (like Sortino ratio), which only considers
+    losses below the target threshold (worse performance). For fractional losses
+    around 1, downside losses are those < target (default 1.0).
+    
+    Args:
+        losses: Tensor of shape (batch_size,) containing individual losses (fractional around 1)
+        target: Target threshold for downside calculation (default 1.0)
+    
+    Returns:
+        Sortino-style geometric mean error (geometric mean / clamped downside std dev)
+    """
+    geom_return = geometric_mean_absolute_error_aggregation(losses)
+    
+    # Calculate downside deviation (only losses below target - worse performance)
+    downside_losses = target - losses
+    downside_losses = torch.where(downside_losses > 0, downside_losses, torch.zeros_like(downside_losses))
+    
+    # Calculate downside standard deviation
+    downside_std = torch.std(downside_losses)
+    
+    # Clamp to prevent division by very small values or excessive normalization
+    downside_std = torch.clamp(downside_std, min=0.003, max=2.0)
+    
+    return geom_return / downside_std
+
+# --- Aggregation Function Selector ---
 def get_loss_aggregation_function(aggregation_method: str):
     """
     Get loss aggregation function by name.
@@ -141,19 +204,37 @@ def get_loss_aggregation_function(aggregation_method: str):
         aggregation_method: String name of the aggregation method
         
     Returns:
-        Aggregation function
+        Aggregation function or None for methods handled by PyTorch directly
         
     Available methods:
-        - 'mse': Mean Square Error
-        - 'gmae': Geometric Mean Absolute Error
-        - 'gmse': Geometric Mean Square Error  
-        - 'huber': Huber Loss (robust to outliers)
+        - 'mse' or 'mean_square_error': Mean Square Error
+        - 'gmae', 'geometric_mean_absolute_error', or 'geometric': Geometric Mean Absolute Error
+        - 'gmse', 'geometric_mean_square_error', or 'geometric_mse': Geometric Mean Square Error  
+        - 'huber' or 'huber_loss': Huber Loss (robust to outliers)
+        - 'standardized_gmae' or 'standardized_geometric_mean_error': Standardized Geometric Mean Absolute Error
+        - 'sortino_gmae' or 'sortino_geometric_mean_error': Sortino-style Geometric Mean Absolute Error (downside deviation)
+        - 'mae' or 'arithmetic': Returns None (handled as stacked_losses.mean())
     """
     aggregation_map = {
         'mse': mean_square_error_aggregation,
         'gmae': geometric_mean_absolute_error_aggregation,
         'gmse': geometric_mean_square_error_aggregation,
-        'huber': huber_loss_aggregation
+        'huber': huber_loss_aggregation,
+        'standardized_gmae': standardized_geometric_mean_error_aggregation,
+        'sortino_gmae': sortino_geometric_mean_error_aggregation,
+        # Full descriptive names
+        'mean_square_error': mean_square_error_aggregation,
+        'geometric_mean_absolute_error': geometric_mean_absolute_error_aggregation,
+        'geometric_mean_square_error': geometric_mean_square_error_aggregation,
+        'huber_loss': huber_loss_aggregation,
+        'standardized_geometric_mean_error': standardized_geometric_mean_error_aggregation,
+        'sortino_geometric_mean_error': sortino_geometric_mean_error_aggregation,
+        # Aliases
+        'geometric': geometric_mean_absolute_error_aggregation,
+        'geometric_mse': geometric_mean_square_error_aggregation,
+        # Methods handled by PyTorch directly (return None)
+        'mae': None,
+        'arithmetic': None
     }
     
     if aggregation_method not in aggregation_map:

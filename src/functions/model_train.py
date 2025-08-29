@@ -20,7 +20,9 @@ try:
         mean_square_error_aggregation, 
         geometric_mean_absolute_error_aggregation,
         geometric_mean_square_error_aggregation,
-        huber_loss_aggregation
+        huber_loss_aggregation,
+        get_loss_aggregation_function
+        winsorize_losses
     )
     from .logging import TrainingLogger
 except ImportError:
@@ -30,7 +32,8 @@ except ImportError:
         mean_square_error_aggregation, 
         geometric_mean_absolute_error_aggregation,
         geometric_mean_square_error_aggregation,
-        huber_loss_aggregation
+        huber_loss_aggregation,
+        get_loss_aggregation_function
     )
     from .logging import TrainingLogger
 
@@ -241,25 +244,21 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
     
     # Stack all losses
     stacked_losses = torch.stack(metric_losses)
+
+    # Winsorised losses to limit extreme values
+    stacked_losses = winsorize_losses(stacked_losses)
     
-    # Apply the selected aggregation method (passed as parameter)
-    if loss_aggregation == 'mae' or loss_aggregation == 'arithmetic':
-        # Mean Absolute Error: Standard arithmetic mean (backward compatibility)
-        metric_loss = stacked_losses.mean()
-    elif loss_aggregation == 'mse':
-        # Mean Square Error: Mean of squared losses
-        metric_loss = mean_square_error_aggregation(stacked_losses)
-    elif loss_aggregation == 'huber':
-        # Huber Loss: Robust to outliers, good for Phase 1 stability
-        metric_loss = huber_loss_aggregation(stacked_losses)
-    elif loss_aggregation == 'gmae' or loss_aggregation == 'geometric':
-        # Geometric Mean Absolute Error: Using log-space operations (numerically stable)
-        metric_loss = geometric_mean_absolute_error_aggregation(stacked_losses)
-    elif loss_aggregation == 'gmse' or loss_aggregation == 'geometric_mse':
-        # Geometric Mean Square Error (default, user's proposed method)
-        metric_loss = geometric_mean_square_error_aggregation(stacked_losses)
-    else:
-        # Fallback to arithmetic mean
+    # Apply the selected aggregation method using the centralized function
+    try:
+        aggregation_func = get_loss_aggregation_function(loss_aggregation)
+        if aggregation_func is None:
+            # Methods like 'mae' and 'arithmetic' are handled directly by PyTorch
+            metric_loss = stacked_losses.mean()
+        else:
+            # Use the specific aggregation function
+            metric_loss = aggregation_func(stacked_losses)
+    except ValueError:
+        # Fallback to arithmetic mean for unknown methods
         metric_loss = stacked_losses.mean()
         print(f"Warning: Unknown loss_aggregation method '{loss_aggregation}', using MAE (arithmetic mean)")
     

@@ -41,7 +41,6 @@ def create_portfolio_time_series(stocks_matrix, weights_vector):
     
     return portfolio_returns
 
-
 #--------------Objective functions/metrics--------------
 def sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, trading_days_per_year=252):
     """
@@ -77,7 +76,6 @@ def sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, trading_days_pe
     
     # Calculate annualized Sharpe ratio (negative for PyTorch minimization)
     return -((mean_return - daily_risk_free_rate) / std_returns * annualization_factor)
-
 
 def geometric_sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, trading_days_per_year=252):
     """
@@ -116,7 +114,6 @@ def geometric_sharpe_ratio(portfolio_price_timeseries, risk_free_rate=0.0, tradi
     # Calculate annualized geometric Sharpe ratio (negative for PyTorch minimization)
     return -((annualized_geometric_return - risk_free_rate) / annualized_std)
 
-
 def max_drawdown(portfolio_price_timeseries):
     """
     Calculate maximum drawdown from a normalized price time series.
@@ -136,7 +133,6 @@ def max_drawdown(portfolio_price_timeseries):
     
     # Return the maximum drawdown (positive value - higher drawdown is worse, so no sign change needed)
     return torch.max(drawdowns)
-
 
 def sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0, trading_days_per_year=252):
     """
@@ -176,7 +172,6 @@ def sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=
     # Calculate annualized Sortino ratio (negative for PyTorch minimization)
     return -((mean_return - daily_risk_free_rate) / downside_deviation * annualization_factor)
 
-
 def geometric_sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0, trading_days_per_year=252):
     """
     Calculate annualized geometric Sortino ratio from a normalized price time series.
@@ -214,7 +209,6 @@ def geometric_sortino_ratio(portfolio_price_timeseries, risk_free_rate=0.0, targ
     # Calculate annualized geometric Sortino ratio (negative for PyTorch minimization)
     return -((annualized_geometric_return - risk_free_rate) / annualized_downside_deviation)
 
-
 def expected_return(portfolio_price_timeseries):
     """
     Calculate the expected return, which is the final value divided by the initial value.
@@ -228,7 +222,6 @@ def expected_return(portfolio_price_timeseries):
     # The portfolio starts at 1.0 (normalized) so we return the final value
     # (negative for PyTorch minimization - higher expected return is better)
     return -portfolio_price_timeseries[-1]
-
 
 def carmdd(portfolio_price_timeseries, trading_days_per_year=252):
     """
@@ -266,7 +259,6 @@ def carmdd(portfolio_price_timeseries, trading_days_per_year=252):
     else:
         return torch.tensor(-1000.0)  # Very high value when no drawdown
 
-
 def omega_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.0):
     """
     Calculate Omega ratio from a normalized price time series.
@@ -296,7 +288,6 @@ def omega_ratio(portfolio_price_timeseries, risk_free_rate=0.0, target_return=0.
     
     # Calculate Omega ratio (negative for PyTorch minimization - higher Omega is better)
     return -(upside_returns.mean() / -downside_returns.mean()) if downside_returns.numel() > 0 else torch.tensor(0.0)
-
 
 def jensen_alpha(portfolio_price_timeseries, market_price_timeseries, risk_free_rate=0.0):
     """
@@ -337,7 +328,6 @@ def jensen_alpha(portfolio_price_timeseries, market_price_timeseries, risk_free_
     # Calculate Jensen's alpha (negative for PyTorch minimization - higher alpha is better)
     return -((portfolio_mean_return - risk_free_rate) - beta * (market_mean_return - risk_free_rate))
 
-
 def treynor_ratio(portfolio_price_timeseries, market_price_timeseries, risk_free_rate=0.0):
     """
     Calculate Treynor ratio from normalized price time series.
@@ -377,7 +367,6 @@ def treynor_ratio(portfolio_price_timeseries, market_price_timeseries, risk_free
     # Calculate Treynor ratio (negative for PyTorch minimization - higher Treynor is better)
     return -((portfolio_mean_return - risk_free_rate) / beta) if beta != 0 else torch.tensor(0.0)
 
-
 def ulcer_index(portfolio_price_timeseries):
     """
     Calculate Ulcer Index from a normalized price time series.
@@ -404,7 +393,6 @@ def ulcer_index(portfolio_price_timeseries):
     
     # Calculate Ulcer Index as RMS of drawdowns (positive value - higher Ulcer Index is worse, so no sign change needed)
     return torch.sqrt(torch.mean(drawdowns ** 2))
-
 
 def k_ratio(portfolio_price_timeseries):
     """
@@ -442,7 +430,6 @@ def k_ratio(portfolio_price_timeseries):
     
     # K-ratio = slope * sqrt(R-squared) * sqrt(n) (negative for PyTorch minimization - higher K-ratio is better)
     return -(slope * torch.sqrt(r_squared) * torch.sqrt(torch.tensor(n, dtype=torch.float32)))
-
 
 def calculate_expected_metric(x_pred, df, metric, *args, **kwargs):
     """
