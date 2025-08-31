@@ -14,6 +14,19 @@ import torch
 import numpy as np
 import pandas as pd
 
+# ============ CPU OPTIMIZATION SETTINGS ============
+# Enable CPU optimizations for faster training
+torch.set_num_threads(os.cpu_count())  # Use all CPU cores
+torch.backends.mkldnn.enabled = True   # Enable Intel MKL-DNN optimizations
+torch.set_default_dtype(torch.float32) # Ensure float32 (faster than float64 on CPU)
+
+print(f"🚀 CPU Optimizations enabled:")
+print(f"   • Using {os.cpu_count()} CPU threads")
+print(f"   • Intel MKL-DNN optimizations: {torch.backends.mkldnn.enabled}")
+print(f"   • Default dtype: {torch.get_default_dtype()}")
+print(f"   • This should significantly speed up training on CPU!")
+print()
+
 sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}\\functions")
 from functions import *
 from functions.training_logger import create_curriculum_logger
@@ -29,7 +42,7 @@ except Exception as e:
     raise RuntimeError("Failed to load S&P 500 data. Please ensure the parquet file exists and is accessible.")
 
 # Define parameters
-past_window_size = 65
+past_window_size = 126
 split_ratio = 0.8
 split_index = int(len(timeseries) * split_ratio)
 
@@ -160,24 +173,24 @@ trained_model = train_model_curriculum(
     optimizer=optimizer,
     data=train_data,
     past_window_size=past_window_size,
-    min_batch_size=1024,
+    min_batch_size=512,
     max_batch_size=4096,
-    n_column_buckets=10,
-    constraint_n_steps=10,
+    n_column_buckets=12,
+    constraint_n_steps=16,
     max_weight_range=(0.05, 0.4),
-    min_assets_range=(3, 10),
-    max_assets_range=(10, 100),
+    min_assets_range=(3, 5),
+    max_assets_range=(5, 20),
     sparsity_threshold_range=(0.001, 0.05),
-    future_window_range=(5, 50),
-    iterations=60,
+    future_window_range=(20, 60),
+    iterations=100,
     loss="expected_return",
     loss_aggregation='standardized_gmae',
-    other_metrics_to_log=['gmae', 'sharpe_ratio', 'carmdd'],
+    other_metrics_to_log=[],
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=1,
-    checkpoint_frequency=6,
-    log_frequency=4
+    checkpoint_frequency=20,
+    log_frequency=10
 )
 
 
@@ -285,7 +298,6 @@ test_model = train_model_curriculum(
     min_batch_size=32,
     max_batch_size=64,
     n_column_buckets=3,
-    max_reasonable_cols=5000,  # Allow up to 5000 columns (instead of default 500)
     constraint_n_steps=3,
     max_weight_range=(0.1, 0.3),
     min_assets_range=(3, 8),

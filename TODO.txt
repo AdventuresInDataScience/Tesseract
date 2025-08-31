@@ -1,9 +1,11 @@
 https://chatgpt.com/c/689f3c2b-d580-8323-aa95-2a271b075606
 
 1. Check/fix grad accumulation to work in a loop like a normal large batch. Will also make iterations easier to work out.
-1b) will need to adjust log accordingly
-2. Add asymmetric winorising to gmse, and winsorising decay
-3. Add a loss which is geo mean/downside std(clamped)
+1b) will need to adjust log accordingly - DONE
+2. Add asymmetric winorising to gmse,( - DONE) and winsorising decay - still pending
+3. Add a loss which is geo mean/downside std(clamped) - DONE
 4. Stock clustering for curriculum (this will be the hardest to do)
 5. Sharpness-aware minimisation (SAM) / Gradient Noise Injection (GNI)
 6. track real geom return in example
+7. Double check the curriculum phases - some of them don't make exact sense to me
+8. Vectorise loop to append in mini batchs which can be set eg 16, to speed up loop without memory explosion
