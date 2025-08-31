@@ -38,6 +38,58 @@ except ImportError:
     )
     from .training_logger import TrainingLogger
 
+#%% --------------- HELPER FUNCTIONS FOR METRICS CONFIGURATION-----------------
+
+def create_additional_metrics_config(metric_configs):
+    """
+    Helper function to create additional_metrics_config for tracking multiple loss/aggregation combinations.
+    
+    Args:
+        metric_configs: List of tuples (name, metric, aggregation, winsorize) or 
+                       List of dictionaries with keys: 'name', 'metric', 'aggregation', 'winsorize'
+    
+    Returns:
+        Dictionary suitable for additional_metrics_config parameter
+        
+    Example:
+        >>> # Using tuples
+        >>> config = create_additional_metrics_config([
+        ...     ('sharpe_huber_raw', 'sharpe_ratio', 'huber', False),
+        ...     ('sharpe_gmae_winsorized', 'sharpe_ratio', 'gmae', True),
+        ...     ('max_drawdown_raw', 'max_drawdown', 'arithmetic', False)
+        ... ])
+        
+        >>> # Using dictionaries
+        >>> config = create_additional_metrics_config([
+        ...     {'name': 'sharpe_huber_raw', 'metric': 'sharpe_ratio', 'aggregation': 'huber', 'winsorize': False},
+        ...     {'name': 'sharpe_gmae_winsorized', 'metric': 'sharpe_ratio', 'aggregation': 'gmae', 'winsorize': True}
+        ... ])
+    """
+    config = {}
+    
+    for item in metric_configs:
+        if isinstance(item, tuple):
+            # Handle tuple format: (name, metric, aggregation, winsorize)
+            if len(item) != 4:
+                raise ValueError(f"Tuple format requires 4 elements: (name, metric, aggregation, winsorize). Got: {item}")
+            name, metric, aggregation, winsorize = item
+        elif isinstance(item, dict):
+            # Handle dictionary format
+            name = item['name']
+            metric = item['metric']
+            aggregation = item['aggregation']
+            winsorize = item['winsorize']
+        else:
+            raise ValueError(f"Each item must be a tuple or dictionary. Got: {type(item)}")
+        
+        config[name] = {
+            'metric': metric,
+            'aggregation': aggregation,
+            'winsorize': winsorize
+        }
+    
+    return config
+
 #%% --------------- SHARED HELPER FUNCTIONS-----------------
 
 def _create_single_sample(data_array, past_window_size, future_window_size, n_cols, valid_indices, max_retries=10):
@@ -180,6 +232,7 @@ def _create_batch(data_array, past_window_size, future_window_size, n_cols, batc
 def _update_model(model, optimizer, past_batch, future_batch, loss, 
                 max_weight=1.0, min_assets=0, max_assets=1000, sparsity_threshold=0.01,
                 regularization_lambda=0.0, loss_aggregation='arithmetic', 
+                additional_metrics_config=None,
                 gradient_accumulation_steps=1, accumulation_step=0, *args, **kwargs):
     """
     Perform forward and backward pass to update the model with gradient accumulation support.
@@ -200,22 +253,31 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
         max_assets: Maximum number of assets constraint (used with raw constraint values)
         sparsity_threshold: Threshold for setting small weights to zero (used with raw constraint values)
         regularization_lambda: Weight for portfolio regularization loss
-        loss_aggregation: Method to aggregate losses across batch:
+        loss_aggregation: Method to aggregate losses across batch for optimization:
             - 'mae' or 'arithmetic': Mean Absolute Error - arithmetic mean
             - 'mse': Mean Square Error - mean of squared losses
             - 'huber': Huber Loss - robust to outliers (good for Phase 1 stability)
             - 'gmae' or 'geometric': Geometric Mean Absolute Error - log-space geometric mean
             - 'gmse' or 'geometric_mse': Geometric Mean Square Error
+        additional_metrics_config: Optional dictionary to track additional metrics with different aggregations:
+            Example: {
+                'sharpe_ratio_huber': {'metric': 'sharpe_ratio', 'aggregation': 'huber', 'winsorize': False},
+                'max_drawdown_raw': {'metric': 'max_drawdown', 'aggregation': 'arithmetic', 'winsorize': False},
+                'sortino_gmae': {'metric': 'sortino_ratio', 'aggregation': 'gmae', 'winsorize': True}
+            }
         gradient_accumulation_steps: Number of steps to accumulate gradients
         accumulation_step: Current step in the accumulation cycle
         *args, **kwargs: Additional arguments passed to metric calculation
     
     Returns:
         Dictionary containing:
-            - 'loss': The total loss value
-            - 'metric_loss': The primary metric loss
+            - 'loss': The total loss value (optimized metric with specified aggregation)
+            - 'metric_loss': The primary metric loss (same as 'loss')
             - 'reg_loss': The regularization loss (if applied)
             - 'weights': The predicted portfolio weights
+            - 'raw_losses': Raw individual losses before winsorization
+            - 'winsorized_losses': Winsorized individual losses
+            - Additional metrics as specified in additional_metrics_config
     """
     # Zero gradients only at the start of accumulation cycle (handled by calling function)
     # The calling function (train_model_progressive) handles optimizer.zero_grad() timing
@@ -243,25 +305,66 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
         metric_loss = calculate_expected_metric(portfolio_timeseries, None, loss, *args, **kwargs)
         metric_losses.append(metric_loss)
     
-    # Stack all losses
-    stacked_losses = torch.stack(metric_losses)
+    # Stack all losses - these are the RAW individual losses
+    raw_losses = torch.stack(metric_losses)
 
-    # Winsorised losses to limit extreme values
-    stacked_losses = winsorize_losses(stacked_losses)
+    # Winsorized losses to limit extreme values for optimization
+    winsorized_losses = winsorize_losses(raw_losses)
     
-    # Apply the selected aggregation method using the centralized function
+    # Apply the selected aggregation method using the centralized function for OPTIMIZATION
     try:
         aggregation_func = get_loss_aggregation_function(loss_aggregation)
         if aggregation_func is None:
             # Methods like 'mae' and 'arithmetic' are handled directly by PyTorch
-            metric_loss = stacked_losses.mean()
+            optimization_loss = winsorized_losses.mean()
         else:
             # Use the specific aggregation function
-            metric_loss = aggregation_func(stacked_losses)
+            optimization_loss = aggregation_func(winsorized_losses)
     except ValueError:
         # Fallback to arithmetic mean for unknown methods
-        metric_loss = stacked_losses.mean()
+        optimization_loss = winsorized_losses.mean()
         print(f"Warning: Unknown loss_aggregation method '{loss_aggregation}', using MAE (arithmetic mean)")
+    
+    # Calculate additional metrics if requested
+    additional_metrics = {}
+    if additional_metrics_config:
+        for metric_name, config in additional_metrics_config.items():
+            try:
+                metric_type = config.get('metric', loss)  # Default to primary loss metric
+                aggregation_method = config.get('aggregation', 'arithmetic')
+                use_winsorization = config.get('winsorize', True)
+                
+                # Calculate losses for the requested metric (if different from primary)
+                if metric_type != loss:
+                    additional_metric_losses = []
+                    for i in range(batch_size):
+                        portfolio_timeseries = create_portfolio_time_series(future_returns, weights[i])
+                        metric_loss = calculate_expected_metric(portfolio_timeseries, None, metric_type, *args, **kwargs)
+                        additional_metric_losses.append(metric_loss)
+                    additional_raw_losses = torch.stack(additional_metric_losses)
+                else:
+                    # Use the same raw losses if it's the same metric
+                    additional_raw_losses = raw_losses
+                
+                # Apply winsorization if requested
+                if use_winsorization:
+                    losses_to_aggregate = winsorize_losses(additional_raw_losses)
+                else:
+                    losses_to_aggregate = additional_raw_losses
+                
+                # Apply aggregation
+                aggregation_func = get_loss_aggregation_function(aggregation_method)
+                if aggregation_func is None:
+                    aggregated_value = losses_to_aggregate.mean()
+                else:
+                    aggregated_value = aggregation_func(losses_to_aggregate)
+                
+                # Store the result
+                additional_metrics[metric_name] = aggregated_value.item() if hasattr(aggregated_value, 'item') else float(aggregated_value)
+                
+            except Exception as e:
+                print(f"Warning: Could not calculate additional metric '{metric_name}': {e}")
+                additional_metrics[metric_name] = float('nan')
     
     # Calculate regularization loss if requested (currently disabled)
     reg_loss = torch.tensor(0.0, device=weights.device)
@@ -270,7 +373,7 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
     #     reg_loss = portfolio_regularization_loss(weights, ...)
     
     # Total loss (currently just metric loss)
-    total_loss = metric_loss  # + regularization_lambda * reg_loss
+    total_loss = optimization_loss  # + regularization_lambda * reg_loss
     
     # Scale loss by accumulation steps for gradient accumulation
     scaled_loss = total_loss / gradient_accumulation_steps
@@ -286,13 +389,20 @@ def _update_model(model, optimizer, past_batch, future_batch, loss,
         # Update parameters
         optimizer.step()
     
-    # Return loss information and weights (using unscaled loss for logging)
-    return {
+    # Return comprehensive loss information and weights (using unscaled loss for logging)
+    result = {
         'loss': total_loss.item(),
-        'metric_loss': metric_loss.item(),
+        'metric_loss': optimization_loss.item(),
         'reg_loss': reg_loss.item() if regularization_lambda > 0.0 else 0.0,
-        'weights': weights.detach()
+        'weights': weights.detach(),
+        'raw_losses': raw_losses.detach(),
+        'winsorized_losses': winsorized_losses.detach()
     }
+    
+    # Add additional metrics to the result
+    result.update(additional_metrics)
+    
+    return result
 
 # %% --------------- PROGRESSIVE MODEL TRAINING FUNCTIONS-----------------
 # Private helper functions for progressive training
@@ -649,7 +759,9 @@ def _progressive_save_final_models_and_logs(model, checkpoint_path, log_path, lo
 def train_model_progressive(model, optimizer, data, past_window_size, future_window_size, min_n_cols = 10, 
                        max_n_cols = 100, min_batch_size = 32, max_batch_size = 256, iterations = 1000, 
                        loss ='sharpe_ratio', loss_aggregation='progressive',
-                       # Additional metrics to log
+                       # Additional metrics tracking with different aggregations
+                       additional_metrics_config=None,
+                       # Legacy support - additional metrics to log
                        other_metrics_to_log=None,
                        # Constraint ranges for random sampling
                        max_weight_range=(0.1, 1.0), min_assets_range=(0, 50), 
@@ -684,18 +796,26 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
         max_batch_size: Final batch size
         iterations: Total number of iterations
         loss: Loss function to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
-        loss_aggregation: Method to aggregate losses across batch
+        loss_aggregation: Method to aggregate losses across batch FOR OPTIMIZATION
             - 'huber': Huber Loss - robust to outliers (Phase 1 stability)
             - 'mse': Mean Square Error - mean of squared losses  
             - 'gmae': Geometric Mean Absolute Error - log-space geometric mean (balanced)
             - 'gmse': Geometric Mean Square Error (most sensitive to outliers)
             - 'progressive': Progressive curriculum: huber → gmae → gmse (recommended for stability)
-        other_metrics_to_log: Additional metrics to calculate and log alongside the primary metric.
+        additional_metrics_config: Dictionary to track additional metrics with different aggregations.
+            Allows you to optimize with one loss/aggregation but track others for analysis.
+            Example: {
+                'sharpe_huber_raw': {'metric': 'sharpe_ratio', 'aggregation': 'huber', 'winsorize': False},
+                'sharpe_gmae_winsorized': {'metric': 'sharpe_ratio', 'aggregation': 'gmae', 'winsorize': True},
+                'max_drawdown_raw': {'metric': 'max_drawdown', 'aggregation': 'arithmetic', 'winsorize': False}
+            }
+            Each entry should have: 'metric' (loss function), 'aggregation' (method), 'winsorize' (bool)
+        other_metrics_to_log: [LEGACY] Additional metrics to calculate and log alongside the primary metric.
             Can be a string (single metric) or list of strings (multiple metrics).
             Available metrics: 'sharpe_ratio', 'geometric_sharpe_ratio', 'max_drawdown', 
             'sortino_ratio', 'geometric_sortino_ratio', 'expected_return', 'carmdd', 
             'omega_ratio', 'jensen_alpha', 'treynor_ratio', 'ulcer_index', 'k_ratio'
-            NOTE: Metrics are logged with positive values for readability (signs are flipped from optimization values)
+            NOTE: For more control, use additional_metrics_config instead
         max_weight_range: (min, max) range for max_weight constraint sampling
         min_assets_range: (min, max) range for min_assets constraint sampling  
         max_assets_range: (min, max) range for max_assets constraint sampling
@@ -714,16 +834,21 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
         Trained model
         
     Example:
-        >>> # Train with progressive loss aggregation and enhanced stability
+        >>> # Train with progressive loss aggregation and track additional metrics
+        >>> additional_metrics = {
+        ...     'sharpe_huber_raw': {'metric': 'sharpe_ratio', 'aggregation': 'huber', 'winsorize': False},
+        ...     'sharpe_gmae_winsorized': {'metric': 'sharpe_ratio', 'aggregation': 'gmae', 'winsorize': True},
+        ...     'max_drawdown_raw': {'metric': 'max_drawdown', 'aggregation': 'arithmetic', 'winsorize': False}
+        ... }
         >>> trained_model = train_model_progressive(
         ...     model=model, 
         ...     optimizer=optimizer, 
         ...     data=df, 
         ...     past_window_size=20, 
         ...     future_window_size=10,
-        ...     loss='sharpe_ratio',
-        ...     other_metrics_to_log=['max_drawdown', 'sortino_ratio'],  # Log additional metrics
-        ...     loss_aggregation='progressive',  # Huber → GMAE → GMSE for maximum stability
+        ...     loss='sharpe_ratio',  # Optimize this metric
+        ...     loss_aggregation='progressive',  # Using progressive aggregation for optimization
+        ...     additional_metrics_config=additional_metrics,  # Track these for analysis
         ...     learning_rate=1e-3,  # Enhanced optimizer settings
         ...     weight_decay=2e-4,
         ...     gradient_accumulation_steps=4,  # 4x larger effective batch size
@@ -753,6 +878,10 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
     current_iteration_loss = 0.0
     current_lr = learning_rate
     current_loss_aggregation = 'progressive'
+    
+    # Initialize gradient accumulation variables
+    accumulation_step = 0
+    accumulated_loss = 0.0
 
     # Set up additional plateau scheduler for fine-tuning
     plateau_scheduler = _progressive_setup_plateau_scheduler(enhanced_optimizer, use_scheduler, scheduler_patience)
@@ -820,6 +949,7 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
                      max_assets=raw_constraints['max_assets'], 
                      sparsity_threshold=raw_constraints['sparsity_threshold'],
                      loss_aggregation=current_loss_aggregation,
+                     additional_metrics_config=additional_metrics_config,
                      gradient_accumulation_steps=gradient_accumulation_steps,
                      accumulation_step=accumulation_step)
         
@@ -896,7 +1026,30 @@ def train_model_progressive(model, optimizer, data, past_window_size, future_win
             'sparsity_threshold_used': raw_constraints['sparsity_threshold']
         }
         
-        # Add additional metrics to training params
+        # Add raw and winsorized loss statistics if available
+        if 'raw_losses' in loss_dict and 'winsorized_losses' in loss_dict:
+            raw_losses = loss_dict['raw_losses']
+            winsorized_losses = loss_dict['winsorized_losses']
+            
+            # Statistics for raw losses
+            training_params['raw_loss_mean'] = float(raw_losses.mean().item())
+            training_params['raw_loss_std'] = float(raw_losses.std().item())
+            training_params['raw_loss_min'] = float(raw_losses.min().item())
+            training_params['raw_loss_max'] = float(raw_losses.max().item())
+            
+            # Statistics for winsorized losses
+            training_params['winsorized_loss_mean'] = float(winsorized_losses.mean().item())
+            training_params['winsorized_loss_std'] = float(winsorized_losses.std().item())
+            training_params['winsorized_loss_min'] = float(winsorized_losses.min().item())
+            training_params['winsorized_loss_max'] = float(winsorized_losses.max().item())
+        
+        # Add additional metrics from additional_metrics_config (these come from loss_dict)
+        if additional_metrics_config:
+            for metric_name in additional_metrics_config.keys():
+                if metric_name in loss_dict:
+                    training_params[metric_name] = loss_dict[metric_name]
+        
+        # Add legacy additional metrics to training params
         for metric_name in other_metrics_list:
             training_params[metric_name] = additional_metrics.get(metric_name, float('nan'))
 
@@ -1262,6 +1415,8 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                            future_window_range=(5, 50),
                            # Training parameters
                            iterations=1000, loss='sharpe_ratio', loss_aggregation='progressive',
+                           # Additional metrics tracking with different aggregations
+                           additional_metrics_config=None,
                            # Additional metrics to log
                            other_metrics_to_log=None,
                            # Logging and checkpoint paths
@@ -1308,10 +1463,19 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
         iterations: Total number of iterations
         loss: Loss function to optimize ('sharpe_ratio', 'geometric_sharpe_ratio', etc.)
         loss_aggregation: Method to aggregate losses across batch (same as progressive function)
+        additional_metrics_config: Dictionary to track additional metrics with different aggregations.
+            Allows you to optimize with one loss/aggregation but track others for analysis.
+            Example: {
+                'sharpe_huber_raw': {'metric': 'sharpe_ratio', 'aggregation': 'huber', 'winsorize': False},
+                'sharpe_gmae_winsorized': {'metric': 'sharpe_ratio', 'aggregation': 'gmae', 'winsorize': True},
+                'max_drawdown_raw': {'metric': 'max_drawdown', 'aggregation': 'arithmetic', 'winsorize': False}
+            }
+            Each entry should have: 'metric' (loss function), 'aggregation' (method), 'winsorize' (bool)
         
         # Other parameters (same as train_model_progressive)
         other_metrics_to_log: Additional metrics to log
             NOTE: Metrics are logged with positive values for readability (signs are flipped from optimization values)
+            NOTE: For more control over aggregation methods, use additional_metrics_config instead
         log_path: Path to save training logs
         checkpoint_path: Path to save model checkpoints
         checkpoint_frequency: How often to save model checkpoints
@@ -1596,6 +1760,7 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 max_assets=raw_constraints['max_assets'], 
                 sparsity_threshold=raw_constraints['sparsity_threshold'],
                 loss_aggregation=current_loss_aggregation,
+                additional_metrics_config=additional_metrics_config,
                 gradient_accumulation_steps=1,  # No accumulation
                 accumulation_step=0  # Always first step since no accumulation
             )
@@ -1648,7 +1813,13 @@ def train_model_curriculum(model, optimizer, data, past_window_size,
                 'future_window_used': batch_future_window
             }
             
-            # Add additional metrics to training_params
+            # Add additional metrics from additional_metrics_config (these come from loss_dict)
+            if additional_metrics_config:
+                for metric_name in additional_metrics_config.keys():
+                    if metric_name in loss_dict:
+                        training_params[metric_name] = loss_dict[metric_name]
+            
+            # Add legacy additional metrics to training_params
             training_params.update(additional_metrics)
             
             # Log this iteration with TrainingLogger

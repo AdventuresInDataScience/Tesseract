@@ -7,6 +7,11 @@ Uses structured phase progression instead of random sampling:
 - Column buckets: Wide → Medium → Narrow asset sampling
 - Constraint expansion: Tight → Loose constraints over 5 steps
 - Enhanced stability: Progressive loss aggregation + memory-efficient training
+
+NEW FEATURE: Additional Metrics Tracking
+- Allows optimization with one loss/aggregation combination but tracking others for analysis
+- Example: Optimize with expected_return + standardized_gmae but track sharpe_ratio + huber
+- Enables comprehensive analysis without compromising optimization stability
 """
 import sys
 import os
@@ -106,6 +111,58 @@ constraint_config = {
     'future_window_range': (5, 50)
 }
 
+# Additional metrics configuration for tracking different aggregation methods
+# Allows optimization with one loss/aggregation but tracking others for analysis
+additional_metrics_config = {
+    'expected_return_huber_raw': {
+        'metric': 'expected_return', 
+        'aggregation': 'huber', 
+        'winsorize': False
+    },
+    'expected_return_gmae_winsorized': {
+        'metric': 'expected_return', 
+        'aggregation': 'gmae', 
+        'winsorize': True
+    },
+    'sharpe_ratio_arithmetic_raw': {
+        'metric': 'sharpe_ratio', 
+        'aggregation': 'arithmetic', 
+        'winsorize': False
+    },
+    'sharpe_ratio_gmse_winsorized': {
+        'metric': 'sharpe_ratio', 
+        'aggregation': 'gmse', 
+        'winsorize': True
+    },
+    'max_drawdown_raw': {
+        'metric': 'max_drawdown', 
+        'aggregation': 'arithmetic', 
+        'winsorize': False
+    }
+}
+
+# Alternative: Use the helper function for easier configuration
+# from functions.model_train import create_additional_metrics_config
+# additional_metrics_config = create_additional_metrics_config([
+#     ('expected_return_huber_raw', 'expected_return', 'huber', False),
+#     ('expected_return_gmae_winsorized', 'expected_return', 'gmae', True),
+#     ('sharpe_ratio_arithmetic_raw', 'sharpe_ratio', 'arithmetic', False),
+#     ('sharpe_ratio_gmse_winsorized', 'sharpe_ratio', 'gmse', True),
+#     ('max_drawdown_raw', 'max_drawdown', 'arithmetic', False)
+# ])
+
+# Demonstrate the helper function
+from functions.model_train import create_additional_metrics_config
+print("🧪 Demonstrating the helper function for additional metrics configuration:")
+
+# Create additional config using the helper function
+helper_config = create_additional_metrics_config([
+    ('expected_return_huber_raw', 'expected_return', 'huber', False),
+    ('sharpe_ratio_gmae_winsorized', 'sharpe_ratio', 'gmae', True)
+])
+
+print(f"Helper function output: {helper_config}")
+print("✅ This allows you to optimize with one loss/aggregation but track others for analysis!\n")
 
 
 # %% Curriculum Training
@@ -173,24 +230,24 @@ trained_model = train_model_curriculum(
     optimizer=optimizer,
     data=train_data,
     past_window_size=past_window_size,
-    min_batch_size=512,
-    max_batch_size=4096,
-    n_column_buckets=12,
-    constraint_n_steps=16,
+    min_batch_size=64,
+    max_batch_size=128,
+    n_column_buckets=4,
+    constraint_n_steps=4,
     max_weight_range=(0.05, 0.4),
     min_assets_range=(3, 5),
     max_assets_range=(5, 20),
     sparsity_threshold_range=(0.001, 0.05),
     future_window_range=(20, 60),
-    iterations=100,
+    iterations=10,
     loss="expected_return",
     loss_aggregation='standardized_gmae',
-    other_metrics_to_log=[],
+    additional_metrics_config=additional_metrics_config,  # Track different aggregations
     learning_rate=1e-3,
     weight_decay=2e-4,
     warmup_steps=1,
-    checkpoint_frequency=20,
-    log_frequency=10
+    checkpoint_frequency=5,
+    log_frequency=5
 )
 
 
@@ -307,6 +364,7 @@ test_model = train_model_curriculum(
     iterations=6,  # Small test - will produce 6 log entries (every iteration)
     loss="expected_return",
     loss_aggregation='huber',
+    additional_metrics_config=helper_config,  # Use the helper function output for demonstration
     other_metrics_to_log=['sharpe_ratio', 'carmdd'],  # Test both metrics
     learning_rate=1e-3,
     weight_decay=2e-4,
