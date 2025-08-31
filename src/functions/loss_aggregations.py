@@ -155,36 +155,39 @@ def standardized_geometric_mean_error_aggregation(losses):
     Aggregate losses using standardized geometric mean error.
     
     This function computes the geometric mean absolute error and normalizes it
-    by the standard deviation of the losses to reduce sensitivity to variance.
-    The standard deviation is clamped to prevent division by very small values
+    by the standard error of the losses (std dev / sqrt(n)) to account for sample size.
+    The standard error is clamped to prevent division by very small values
     or excessive normalization from very large values.
     
     Args:
         losses: Tensor of shape (batch_size,) containing individual losses
     
     Returns:
-        Standardized geometric mean error (geometric mean / clamped std dev)
+        Standardized geometric mean error (geometric mean / clamped standard error)
     """
     geom_return = geometric_mean_absolute_error_aggregation(losses)
-    std_dev = torch.std(losses)
-    std_dev = torch.clamp(std_dev, min=0.003, max=2.0)  # clamp from 0.003 to 2
-    return geom_return / std_dev
+    n = losses.size(0)  # Sample size
+    std_dev = torch.std(losses, unbiased=True)  # Use Bessel's correction (ddof=1)
+    std_error = std_dev / torch.sqrt(torch.tensor(n, dtype=losses.dtype, device=losses.device))
+    std_error = torch.clamp(std_error, min=0.003, max=2.0)  # clamp from 0.003 to 2
+    return geom_return / std_error
 
 def sortino_geometric_mean_error_aggregation(losses, target=1.0):
     """
     Aggregate losses using Sortino-style geometric mean error.
     
     This function computes the geometric mean absolute error and normalizes it
-    by the downside standard deviation (like Sortino ratio), which only considers
-    losses below the target threshold (worse performance). For fractional losses
-    around 1, downside losses are those < target (default 1.0).
+    by the downside standard error (like Sortino ratio), which only considers
+    losses below the target threshold (worse performance). Uses standard error
+    to account for sample size. For fractional losses around 1, downside losses 
+    are those < target (default 1.0).
     
     Args:
         losses: Tensor of shape (batch_size,) containing individual losses (fractional around 1)
         target: Target threshold for downside calculation (default 1.0)
     
     Returns:
-        Sortino-style geometric mean error (geometric mean / clamped downside std dev)
+        Sortino-style geometric mean error (geometric mean / clamped downside standard error)
     """
     geom_return = geometric_mean_absolute_error_aggregation(losses)
     
@@ -192,13 +195,20 @@ def sortino_geometric_mean_error_aggregation(losses, target=1.0):
     downside_losses = target - losses
     downside_losses = torch.where(downside_losses > 0, downside_losses, torch.zeros_like(downside_losses))
     
-    # Calculate downside standard deviation
-    downside_std = torch.std(downside_losses)
+    # Count non-zero downside losses for effective sample size
+    effective_n = torch.sum(downside_losses > 0).float()
+    effective_n = torch.clamp(effective_n, min=1.0)  # Prevent division by zero
+    
+    # Calculate downside standard deviation with Bessel's correction
+    downside_std = torch.std(downside_losses, unbiased=True)
+    
+    # Calculate downside standard error
+    downside_std_error = downside_std / torch.sqrt(effective_n)
     
     # Clamp to prevent division by very small values or excessive normalization
-    downside_std = torch.clamp(downside_std, min=0.003, max=2.0)
+    downside_std_error = torch.clamp(downside_std_error, min=0.003, max=2.0)
     
-    return geom_return / downside_std
+    return geom_return / downside_std_error
 
 # --- Aggregation Function Selector ---
 def get_loss_aggregation_function(aggregation_method: str):
